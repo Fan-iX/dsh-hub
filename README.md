@@ -62,13 +62,23 @@ dsh's settings/credentials plane (the Settings → Models page) is browser-gated
 to loopback pages: `connection.isLoopback` is derived from `location.hostname`,
 so a LAN-hostname page reports `settings are unavailable in this browser` even
 though the hub's origin-rewrite already passes the server-side loopback fence.
-`Location` members are `[LegacyUnforgeable]` own accessors — no polyfill can
-spoof them — so dsh-hub instead rewrites the connection plugin bundle in
-flight: `isLoopbackHostname(pageLocation.hostname)` becomes `true`. The patch
-is pattern-based against dsh's unminified bundle, cached per bundle rev, and
-fails loud in the hub log when an upstream upgrade renames the expression.
-Trust stays with the hub: only PAM-authenticated users reach the backend at
-all, and the SameSite=Lax session cookie still blocks cross-site requests.
+The flag also chooses the settings mirror's persistence (`host` on loopback,
+`memory` elsewhere), and in `memory` mode the Models store never reads the
+provider catalog. dsh-hub injects the transport hook dsh's connection client
+already honors:
+
+```js
+window.__DSH_TRANSPORT__ = Object.assign({}, window.__DSH_TRANSPORT__, { ownsHost: true })
+```
+
+so `isLoopback` is true before the client looks at the hostname. The hook
+carries no `rpc`/`fetch`/`openStream`, so the connection RPC caller falls back to
+the page's global fetch, and no cordis service is rewritten. (Patching the
+served plugin bundle does not work: the shell loads plugins through combo URLs —
+`/plugins/??<id>/client.js,…&rev=…` — not the `*.js?rev=` chunk URLs a text patch
+could target.) Trust stays with the hub: only PAM-authenticated users reach the
+backend at all, and the SameSite=Lax session cookie still blocks cross-site
+requests.
 
 ### Browser-session bridge (dsh's own auth)
 
