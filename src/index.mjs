@@ -756,11 +756,37 @@ function handleLogout(req, res) {
   res.end();
 }
 
-const STARTING_PAGE = `<!doctype html><html lang="zh"><head><meta charset="utf-8">
-<meta http-equiv="refresh" content="3"><title>starting…</title>
-<style>body{font-family:system-ui;background:#101418;color:#e6e6e6;display:flex;
-justify-content:center;padding-top:12rem}p{color:#8b97a3}</style></head>
-<body><p>正在为你的账号启动 dsh 实例,首次约需 10 秒,即将自动刷新…</p></body></html>`;
+// Static cold-start screen: the browser lands here immediately instead of
+// waiting on the spawn, and the meta refresh retries the URL until the instance
+// answers. CSS-only, no script.
+const STARTING_PAGE = `<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="3">
+<title>正在启动 dsh 实例…</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: system-ui, sans-serif; background: #101418; color: #e6e6e6;
+         display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+  .card { text-align: center; }
+  .spinner { width: 34px; height: 34px; margin: 0 auto 1.4rem; border-radius: 50%;
+             border: 3px solid #2c3641; border-top-color: #3b82f6;
+             animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  p { margin: .3rem 0; }
+  .sub { color: #8b97a3; font-size: .85rem; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="spinner"></div>
+    <p>正在为你的账号启动 dsh 实例…</p>
+    <p class="sub">首次加载可能需要等待几十秒,页面会自动刷新</p>
+  </div>
+</body>
+</html>`;
 
 // ------------------------------------------- /api/session/list response cache --
 // dsh's session/list recomputes projections for every session (zstd-decode of
@@ -1007,6 +1033,25 @@ function prewarmSessionList(user, be) {
     .finally(() => prewarmInflight.delete(key));
 }
 
+// Spawns running in the background, and the last spawn failure per user. A
+// request that needs a cold backend starts the spawn here and answers at once
+// (loading page or 503), instead of holding the navigation open for up to
+// SPAWN_TIMEOUT_MS.
+const spawnInflight = new Set();
+const spawnFailures = new Map();
+
+/** Start (or join) a backend spawn without blocking the request that needs it. */
+function startBackendInBackground(user) {
+  if (spawnInflight.has(user)) return;
+  spawnInflight.add(user);
+  void getOrCreateBackend(user)
+    .catch((err) => {
+      console.error(`[hub] spawn failed for ${user}:`, err.message);
+      spawnFailures.set(user, err.message);
+    })
+    .finally(() => spawnInflight.delete(user));
+}
+
 async function route(req, res) {
   const url = new URL(req.url, 'http://x');
 
@@ -1105,22 +1150,28 @@ async function route(req, res) {
     return;
   }
 
-  // Fast path: spawn already in progress — show the "starting" page instead
-  // of blocking the request for the full spawn duration.
-  const existing = backends.get(user);
-  if (existing?.starting) {
-    sendHtml(res, 200, STARTING_PAGE);
+  // Never block on a cold backend: start (or join) the spawn in the background
+  // and answer immediately. The index navigation gets the static loading page,
+  // whose meta refresh retries this URL; anything else gets a retryable 503 so
+  // an API call cannot hang for the whole spawn either.
+  let be = backends.get(user);
+  if (!be || !be.child || be.child.exitCode !== null || be.starting) {
+    const failure = spawnFailures.get(user);
+    if (failure !== undefined) {
+      spawnFailures.delete(user);
+      sendHtml(res, 503, `<pre>dsh-hub: 无法启动你的实例\n${failure}</pre>`);
+      return;
+    }
+    startBackendInBackground(user);
+    if (req.method === 'GET' && isIndexPath(url.pathname)) {
+      sendHtml(res, 200, STARTING_PAGE);
+    } else {
+      res.writeHead(503, { 'retry-after': '3', 'content-type': 'text/plain; charset=utf-8' });
+      res.end('dsh-hub: dsh instance is starting\n');
+    }
     return;
   }
-
-  let be;
-  try {
-    be = await getOrCreateBackend(user);
-  } catch (err) {
-    console.error(`[hub] spawn failed for ${user}:`, err.message);
-    sendHtml(res, 503, `<pre>dsh-hub: 无法启动你的实例\n${err.message}</pre>`);
-    return;
-  }
+  spawnFailures.delete(user);
   be.lastActivity = Date.now();
   req.hubBackend = be; // lets the proxy 401 handler re-mint dsh's session cookie
   // First navigation of an authenticated session: mint dsh's own browser-session

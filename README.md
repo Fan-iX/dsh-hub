@@ -144,6 +144,11 @@ username/password**, and get a private dsh instance.
 
 ## Notes
 
+- A cold instance never holds a navigation open: the first request after login
+  gets a static loading page (auto-refresh every 3 s, "首次加载可能需要等待几十秒")
+  while the spawn runs in the background, then the page reloads into the app.
+  Non-index requests during startup get `503` + `Retry-After: 3` instead of
+  blocking, and a spawn failure surfaces as `dsh-hub: 无法启动你的实例`.
 - Runtime state lives in the **working directory the hub is started from**
   (`WorkingDirectory` under systemd), never in the checkout: the HMAC secret at
   `$CWD/.cookie-secret` and the persisted `session.list` cache under
