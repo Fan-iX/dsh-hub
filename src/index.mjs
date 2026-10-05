@@ -67,7 +67,9 @@ function detectDshBin() {
     '/usr/local/lib/dsh/apps/cli/lib/bin.js',
     path.resolve(__dirname, '../node_modules/@deepseek-ai/dsh/lib/bin.js'),
     '/usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js',
+    '/usr/local/lib64/node_modules/@deepseek-ai/dsh/lib/bin.js',
     '/usr/lib/node_modules/@deepseek-ai/dsh/lib/bin.js',
+    '/usr/lib64/node_modules/@deepseek-ai/dsh/lib/bin.js',
   ];
   for (const c of candidates) {
     try { fs.accessSync(c, fs.constants.X_OK); return c; } catch { /* next */ }
@@ -756,37 +758,11 @@ function handleLogout(req, res) {
   res.end();
 }
 
-// Static cold-start screen: the browser lands here immediately instead of
-// waiting on the spawn, and the meta refresh retries the URL until the instance
-// answers. CSS-only, no script.
-const STARTING_PAGE = `<!doctype html>
-<html lang="zh">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="3">
-<title>正在启动 dsh 实例…</title>
-<style>
-  :root { color-scheme: dark; }
-  body { font-family: system-ui, sans-serif; background: #101418; color: #e6e6e6;
-         display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
-  .card { text-align: center; }
-  .spinner { width: 34px; height: 34px; margin: 0 auto 1.4rem; border-radius: 50%;
-             border: 3px solid #2c3641; border-top-color: #3b82f6;
-             animation: spin 1s linear infinite; }
-  @keyframes spin { to { transform: rotate(360deg); } }
-  p { margin: .3rem 0; }
-  .sub { color: #8b97a3; font-size: .85rem; }
-</style>
-</head>
-<body>
-  <div class="card">
-    <div class="spinner"></div>
-    <p>正在为你的账号启动 dsh 实例…</p>
-    <p class="sub">首次加载可能需要等待几十秒,页面会自动刷新</p>
-  </div>
-</body>
-</html>`;
+const STARTING_PAGE = `<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<meta http-equiv="refresh" content="3"><title>starting…</title>
+<style>body{font-family:system-ui;background:#101418;color:#e6e6e6;display:flex;
+justify-content:center;padding-top:12rem}p{color:#8b97a3}</style></head>
+<body><p>正在为你的账号启动 dsh 实例,首次约需 10 秒,即将自动刷新…</p></body></html>`;
 
 // ------------------------------------------- /api/session/list response cache --
 // dsh's session/list recomputes projections for every session (zstd-decode of
@@ -1107,7 +1083,7 @@ async function route(req, res) {
       be = await getOrCreateBackend(user);
     } catch (err) {
       console.error(`[hub] spawn failed for ${user}:`, err.message);
-      sendHtml(res, 503, `<pre>dsh-hub: 无法启动你的实例\n${err.message}</pre>`);
+      sendHtml(res, 503, `<pre>dsh-hub: fail to launch\n${err.message}</pre>`);
       return;
     }
     be.lastActivity = Date.now();
@@ -1159,7 +1135,7 @@ async function route(req, res) {
     const failure = spawnFailures.get(user);
     if (failure !== undefined) {
       spawnFailures.delete(user);
-      sendHtml(res, 503, `<pre>dsh-hub: 无法启动你的实例\n${failure}</pre>`);
+      sendHtml(res, 503, `<pre>dsh-hub: fail to launch\n${failure}</pre>`);
       return;
     }
     startBackendInBackground(user);
