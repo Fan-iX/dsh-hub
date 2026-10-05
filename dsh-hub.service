@@ -6,18 +6,18 @@ Wants=network-online.target
 [Service]
 Type=simple
 # Adjust to your node and dsh locations
-Environment=DSH_BIN=/home/zizhang/scripts/deepseek-harness/apps/cli/lib/bin.js
+# Environment=DSH_BIN=/opt/dsh-hub/node_modules/@deepseek-ai/dsh/lib/bin.js
 Environment=HUB_PORT=3080
 Environment=HUB_LOG_DIR=/var/log/dsh-hub
 # Environment=IDLE_CULL_MS=0
 # Environment=ALLOW_USERS=alice,bob
-ExecStart=/home/zizhang/.nvm/versions/node/v22.22.2/bin/node /home/zizhang/dsh-hub/src/index.mjs
+ExecStart=/usr/bin/env node /opt/dsh-hub/src/index.mjs
 Restart=on-failure
 RestartSec=3
 
 # Root needed for: setuid spawn, iptables loopback guards, reading user homes.
 User=root
-WorkingDirectory=/home/zizhang/dsh-hub
+WorkingDirectory=/var/lib/dsh-hub
 
 [Install]
 WantedBy=multi-user.target

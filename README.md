@@ -22,6 +22,46 @@ browser ──http://<server-ip>:3080──▶ dsh-hub ──cookie──▶ 127
                                         │                127.0.0.1:<port> ──▶ dsh (user B)
                                         └─ spawn as uid/gid + iptables owner-guard
 ```
+## Quick start
+
+```bash
+git clone https://github.com/Mpaperlee/dsh-hub.git /opt/dsh-hub
+cd /opt/dsh-hub && npm install
+# optional: install `@deepseek-ai/dsh` within the same repo
+npm install @deepseek-ai/dsh
+
+# dev run (no root: no setuid/iptables, single-user semantics)
+DSH_BIN=/path/to/deepseek-harness/apps/cli/lib/bin.js HUB_PORT=3080 \
+  HUB_LOG_DIR=/tmp npm start
+```
+
+Production (root, systemd):
+
+```bash
+sudo cp dsh-hub.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now dsh-hub
+```
+
+Users browse to `http://<server-ip>:3080`, log in with their **system
+username/password**, and get a private dsh instance.
+
+## Configuration
+
+| Env | Default | Meaning |
+|---|---|---|
+| `DSH_BIN` | `$DSH_HUB_DIR/node_modules/@deepseek-ai/dsh/lib/bin.js` | dsh CLI entry (built checkout: `apps/cli/lib/bin.js`) |
+| `HUB_HOST` / `HUB_PORT` | `0.0.0.0` / `3080` | hub listen address |
+| `TRUST_MODE` | `origin-rewrite` | `trusted-host` forwards Host/Origin untouched (see trust model above) |
+| `TRUSTED_HOSTS` | auto (LAN IPv4s) | extra authorities for `--trusted-host` (hostnames/DNS names) |
+| `IDLE_CULL_MS` | `14400000` (4h) | `0` disables culling — backends keep running with the browser closed |
+| `SESSION_TTL_MS` | 7 days | cookie lifetime |
+| `ALLOW_USERS` | *(all)* | comma-separated username allow-list |
+| `HUB_LOG_DIR` | `/var/log/dsh-hub` | per-user backend logs |
+| `COOKIE_SECRET_FILE` | `$CWD/.cookie-secret` | HMAC secret (auto-generated, `0600`) |
+| `HUB_CLEAN_ON_STOP` | `1` | on `SIGTERM`/`SIGINT`/`SIGHUP`, stop instances and delete `$CWD/cache` + the cookie secret; `0` keeps them |
+| `SHUTDOWN_GRACE_MS` | `5000` | how long a backend may take to exit before it is `SIGKILL`ed |
+
+
 
 ## Architecture (the JupyterHub analogy)
 
@@ -104,43 +144,6 @@ the hub logs a warning and passes dsh's own 401 through unchanged.
   (loopback, `--uid-owner`) DROPs connections from other local users
 - Login rate-limiting (5 failures → 1 min lockout per IP)
 - Optional `ALLOW_USERS` allow-list
-
-## Quick start
-
-```bash
-git clone https://github.com/Mpaperlee/dsh-hub.git /opt/dsh-hub
-cd /opt/dsh-hub && npm install
-
-# dev run (no root: no setuid/iptables, single-user semantics)
-DSH_BIN=/path/to/deepseek-harness/apps/cli/lib/bin.js HUB_PORT=3080 \
-  HUB_LOG_DIR=/tmp npm start
-```
-
-Production (root, systemd):
-
-```bash
-sudo cp dsh-hub.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now dsh-hub
-```
-
-Users browse to `http://<server-ip>:3080`, log in with their **system
-username/password**, and get a private dsh instance.
-
-## Configuration
-
-| Env | Default | Meaning |
-|---|---|---|
-| `DSH_BIN` | *(required)* | dsh CLI entry (built checkout: `apps/cli/lib/bin.js`) |
-| `HUB_HOST` / `HUB_PORT` | `0.0.0.0` / `3080` | hub listen address |
-| `TRUST_MODE` | `origin-rewrite` | `trusted-host` forwards Host/Origin untouched (see trust model above) |
-| `TRUSTED_HOSTS` | auto (LAN IPv4s) | extra authorities for `--trusted-host` (hostnames/DNS names) |
-| `IDLE_CULL_MS` | `14400000` (4h) | `0` disables culling — backends keep running with the browser closed |
-| `SESSION_TTL_MS` | 7 days | cookie lifetime |
-| `ALLOW_USERS` | *(all)* | comma-separated username allow-list |
-| `HUB_LOG_DIR` | `/var/log/dsh-hub` | per-user backend logs |
-| `COOKIE_SECRET_FILE` | `$CWD/.cookie-secret` | HMAC secret (auto-generated, `0600`) |
-| `HUB_CLEAN_ON_STOP` | `1` | on `SIGTERM`/`SIGINT`/`SIGHUP`, stop instances and delete `$CWD/cache` + the cookie secret; `0` keeps them |
-| `SHUTDOWN_GRACE_MS` | `5000` | how long a backend may take to exit before it is `SIGKILL`ed |
 
 ## Notes
 
