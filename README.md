@@ -129,6 +129,8 @@ username/password**, and get a private dsh instance.
 | `ALLOW_USERS` | *(all)* | comma-separated username allow-list |
 | `HUB_LOG_DIR` | `/var/log/dsh-hub` | per-user backend logs |
 | `COOKIE_SECRET_FILE` | `$CWD/.cookie-secret` | HMAC secret (auto-generated, `0600`) |
+| `HUB_CLEAN_ON_STOP` | `1` | on `SIGTERM`/`SIGINT`/`SIGHUP`, stop instances and delete `$CWD/cache` + the cookie secret; `0` keeps them |
+| `SHUTDOWN_GRACE_MS` | `5000` | how long a backend may take to exit before it is `SIGKILL`ed |
 
 ## Notes
 
@@ -137,6 +139,13 @@ username/password**, and get a private dsh instance.
   `$CWD/.cookie-secret` and the persisted `session.list` cache under
   `$CWD/cache/`. Point a service at a writable data directory and the source
   tree can stay read-only.
+- On `SIGTERM`/`SIGINT`/`SIGHUP` the hub stops every spawned dsh instance (their
+  whole process group, `SIGTERM` then `SIGKILL` after `SHUTDOWN_GRACE_MS`),
+  releases their loopback guards, and deletes the persisted cache and the cookie
+  secret — so a stopped hub leaves no running instances and no reusable session
+  material behind. Cleanup is bounded and best-effort; a second signal exits
+  immediately. Set `HUB_CLEAN_ON_STOP=0` to keep the cache and secret across
+  restarts.
 - Conversations survive browser close: goal/server-side drivers keep running
   in the spawned dsh process; re-login reattaches to the same instance.
 - `sudo systemctl restart dsh-hub` after config changes.
