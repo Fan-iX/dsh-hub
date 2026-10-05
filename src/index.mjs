@@ -105,7 +105,12 @@ function hasBin(name) {
 
 // ----------------------------------------------------------- cookie secret --
 
-const SECRET_PATH = process.env.COOKIE_SECRET_FILE ?? path.join(__dirname, '..', '.cookie-secret');
+// Runtime state (the signing secret and the session-list cache) lives in the
+// launch directory — the service's WorkingDirectory — not in the checkout,
+// which may be read-only or shared after deployment. Both paths are therefore
+// resolved from the process working directory, not relative to this module.
+const RUNTIME_DIR = process.cwd();
+const SECRET_PATH = process.env.COOKIE_SECRET_FILE ?? path.join(RUNTIME_DIR, '.cookie-secret');
 let SECRET;
 {
   try {
@@ -622,8 +627,8 @@ const STARTING_PAGE = `<!doctype html><html lang="zh"><head><meta charset="utf-8
 justify-content:center;padding-top:12rem}p{color:#8b97a3}</style></head>
 <body><p>正在为你的账号启动 dsh 实例,首次约需 10 秒,即将自动刷新…</p></body></html>`;
 
-// ------------------------------------------- /api/session.list response cache --
-// dsh's session.list recomputes projections for every session (zstd-decode of
+// ------------------------------------------- /api/session/list response cache --
+// dsh's session/list recomputes projections for every session (zstd-decode of
 // large logs + projection apply); on this deployment it routinely takes
 // 40-66s — far past the web client's 30s unary timeout, so the sidebar renders
 // no history whenever the cache is cold. This cache makes the sidebar always
@@ -633,17 +638,23 @@ justify-content:center;padding-top:12rem}p{color:#8b97a3}</style></head>
 // Revalidation failures keep the stale entry and back off, so a dead backend
 // never empties the sidebar. Only 200 responses are cached; keys are per
 // user + request-body hash so different payloads never mix.
-const SESSION_LIST_PATH = '/api/session.list';
+//
+// The wire endpoint is `session/list` (slash, not the old `session.list`) and
+// its args travel as `payload.args._request`; a cached server-response is
+// republished under the caller's rpcId because the client rejects a mismatched
+// echo.
+const SESSION_LIST_PATH = '/api/session/list';
 const RPC_CACHE_REVALIDATE_MS = 60_000;   // min gap between background refreshes (12MB responses; keep the hub event loop free)
 const RPC_CACHE_FAIL_BACKOFF_MS = 30_000; // pause after a failed refresh
 const rpcCache = new Map(); // key -> { status, headers, body, nextRevalidateAt, inflight }
 const RPC_CACHE_MAX = 500;
 const prewarmInflight = new Set();
-// Cache survives hub restarts: entries persist under <hub>/cache/session-list-<hash>.json.
-const CACHE_DIR = path.join(__dirname, '..', 'cache');
+// Cache survives hub restarts: entries persist under <cwd>/cache/session-list-<hash>.json.
+const CACHE_DIR = path.join(RUNTIME_DIR, 'cache');
 const CACHE_PERSIST_GAP_MS = 300_000;     // throttle disk writes per key (16MB base64 files; async, off the hot path)
 const STANDARD_SESSION_LIST_BODY = Buffer.from(JSON.stringify({
-  type: 'client-request', rpcId: 'hub-prewarm', method: 'session.list', payload: {},
+  type: 'client-request', rpcId: 'hub-prewarm', method: 'session/list',
+  payload: { args: { _request: {} } },
 }));
 
 function sessionListCacheKey(user, body) {
@@ -658,7 +669,7 @@ function sessionListCacheKey(user, body) {
     /* keep full-body hash */
   }
   const hash = crypto.createHash('sha256').update(payload).digest('hex').slice(0, 16);
-  return `${user}:session.list:${hash}`;
+  return `${user}:session/list:${hash}`;
 }
 
 function cacheFilePathFor(key) {
@@ -756,14 +767,38 @@ function forwardSessionList(be, headers, body) {
   });
 }
 
-function serveCachedSessionList(res, entry) {
+/** The rpcId a client-request envelope carries, when the body is one. */
+function requestRpcId(body) {
+  try {
+    const parsed = JSON.parse(body.toString('utf8'));
+    return typeof parsed?.rpcId === 'string' ? parsed.rpcId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Republish a cached server-response under the caller's rpcId; the client rejects a mismatched echo. */
+function withRpcId(body, rpcId) {
+  if (rpcId === undefined) return body;
+  try {
+    const parsed = JSON.parse(body.toString('utf8'));
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return body;
+    parsed.rpcId = rpcId;
+    return Buffer.from(JSON.stringify(parsed));
+  } catch {
+    return body;
+  }
+}
+
+function serveCachedSessionList(res, entry, rpcId) {
   if (res.destroyed || res.writableEnded) return;
+  const body = withRpcId(entry.body, rpcId);
   try {
     res.writeHead(entry.status, {
       'content-type': entry.headers['content-type'] ?? 'application/json',
-      'content-length': entry.body.length,
+      'content-length': body.length,
     });
-    res.end(entry.body);
+    res.end(body);
   } catch {
     /* client already gone — nothing to serve */
   }
@@ -850,7 +885,7 @@ async function route(req, res) {
     const entry = rpcCache.get(key);
     const now = Date.now();
     if (entry) {
-      serveCachedSessionList(res, entry);
+      serveCachedSessionList(res, entry, requestRpcId(body));
       if (now >= entry.nextRevalidateAt && !entry.inflight) {
         entry.inflight = true;
         const be = backends.get(user);

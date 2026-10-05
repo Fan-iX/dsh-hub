@@ -111,10 +111,15 @@ username/password**, and get a private dsh instance.
 | `SESSION_TTL_MS` | 7 days | cookie lifetime |
 | `ALLOW_USERS` | *(all)* | comma-separated username allow-list |
 | `HUB_LOG_DIR` | `/var/log/dsh-hub` | per-user backend logs |
-| `COOKIE_SECRET_FILE` | `./.cookie-secret` | HMAC secret (auto-generated, `0600`) |
+| `COOKIE_SECRET_FILE` | `$CWD/.cookie-secret` | HMAC secret (auto-generated, `0600`) |
 
 ## Notes
 
+- Runtime state lives in the **working directory the hub is started from**
+  (`WorkingDirectory` under systemd), never in the checkout: the HMAC secret at
+  `$CWD/.cookie-secret` and the persisted `session.list` cache under
+  `$CWD/cache/`. Point a service at a writable data directory and the source
+  tree can stay read-only.
 - Conversations survive browser close: goal/server-side drivers keep running
   in the spawned dsh process; re-login reattaches to the same instance.
 - `sudo systemctl restart dsh-hub` after config changes.
