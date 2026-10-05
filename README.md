@@ -70,6 +70,23 @@ fails loud in the hub log when an upstream upgrade renames the expression.
 Trust stays with the hub: only PAM-authenticated users reach the backend at
 all, and the SameSite=Lax session cookie still blocks cross-site requests.
 
+### Browser-session bridge (dsh's own auth)
+
+Since dsh 0.2.0-rc, `dsh web` has its own browser auth on top of the hub's PAM
+session: the index and every `/api` route require a signed `dsh-auth-*` cookie
+that dsh mints **only** from the per-process `?token=` URL it prints once at
+startup (`dsh web: http://127.0.0.1:<port>/?token=…`). The hub's cookie means
+nothing to dsh, so a PAM login used to land on `401 dsh web authentication
+required; reopen the URL printed by dsh web.`
+
+dsh-hub bridges the two: it captures that token from the backend's stdout and
+performs the exchange itself — one loopback `GET /?token=…` with the authority
+the proxied browser request will present — then relays dsh's `Set-Cookie` to the
+browser and redirects to the clean index. A stale cookie that dsh rejects is
+re-minted on the 401. The token never reaches the browser, the URL bar stays
+clean, and dsh is not modified. If upstream ever stops printing the token line,
+the hub logs a warning and passes dsh's own 401 through unchanged.
+
 ## Isolation guarantees (run as root)
 
 - Each dsh instance runs as the user's own **uid/gid** with `DSH_HOME=~/.dsh`

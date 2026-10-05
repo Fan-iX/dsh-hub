@@ -65,6 +65,9 @@ function detectDshBin() {
     path.join(process.cwd(), 'deepseek-harness/apps/cli/lib/bin.js'),
     path.resolve(__dirname, '../../deepseek-harness/apps/cli/lib/bin.js'),
     '/usr/local/lib/dsh/apps/cli/lib/bin.js',
+    path.resolve(__dirname, '../node_modules/@deepseek-ai/dsh/lib/bin.js'),
+    '/usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js',
+    '/usr/lib/node_modules/@deepseek-ai/dsh/lib/bin.js',
   ];
   for (const c of candidates) {
     try { fs.accessSync(c, fs.constants.X_OK); return c; } catch { /* next */ }
@@ -235,6 +238,11 @@ class Backend {
     this.ready = null;      // promise resolved when TCP accepts
     this.lastActivity = Date.now();
     this.starting = false;
+    this.launchToken = null;          // dsh's one-shot browser-session launch token, parsed from stdout
+    this.launchTokenUnavailable = false;
+    this.launchTokenWaiters = [];
+    this.internalCookie = null;       // hub-minted dsh cookie for its own /api calls (prewarm/revalidate)
+    this.bridgeAttemptAt = 0;         // throttles 401-triggered re-mints
   }
 }
 
@@ -356,12 +364,27 @@ async function getOrCreateBackend(user) {
   else console.warn('[hub] non-root: spawning dsh as hub user (dev mode, no isolation)');
 
   console.log(`[hub] spawning dsh for ${user} (uid ${info.uid}) on 127.0.0.1:${port}, DSH_HOME=${env.DSH_HOME}`);
-  const args = [CFG.dshBin, 'web', '--port', String(port)];
+  const args = [CFG.dshBin, 'web', '--port', String(port), "--no-open"];
   if (TRUST_MODE === 'trusted-host') {
     for (const authority of TRUSTED_HOSTS) args.push('--trusted-host', authority);
   }
   const child = spawn(process.execPath, args, opts);
   be.child = child;
+  // dsh prints, once at readiness, the only URL that can mint its browser-session
+  // cookie: `dsh web: http://127.0.0.1:<port>/?token=<token>`. Capture that token
+  // in flight so the hub can spend it on behalf of PAM-authenticated browsers.
+  let stdoutTail = '';
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', (chunk) => {
+    if (be.launchToken) return;
+    stdoutTail = (stdoutTail + chunk).slice(-8192);
+    const line = /dsh web:\s+(\S+)/.exec(stdoutTail);
+    if (!line) return;
+    try {
+      const token = new URL(line[1]).searchParams.get('token');
+      if (token) setLaunchToken(be, token);
+    } catch { /* URL not fully written yet — keep buffering */ }
+  });
   const log = logStreamFor(user);
   if (log !== 'ignore') {
     child.stdout.pipe(log, { end: false });
@@ -401,6 +424,115 @@ if (CFG.idleCullMs > 0) {
       if (now - be.lastActivity > CFG.idleCullMs) stopBackend(user);
     }
   }, 60_000).unref();
+}
+
+// --------------------------------------------- dsh browser-session bridge ----
+// dsh gates its index (and every /api channel) on its own `dsh-auth-*` cookie,
+// which is minted ONLY by a request carrying the per-process `?token=` value
+// printed once at startup. The hub's PAM cookie means nothing to dsh, so an
+// authenticated hub session used to land on `401 dsh web authentication
+// required; reopen the URL printed by dsh web.`
+//
+// The hub captures that token from the backend's stdout and performs the
+// exchange itself: one loopback `GET /?token=<token>` using the authority the
+// proxied browser request will present, then it relays dsh's Set-Cookie to the
+// browser and redirects to the clean index. The token never reaches the browser,
+// the URL bar stays clean, and dsh is not modified — the hub only automates the
+// step dsh already documents.
+
+/** dsh's deterministic browser-session cookie name for one request authority. */
+function dshCookieName(authority) {
+  return 'dsh-auth-' + crypto.createHash('sha256').update(authority).digest('base64url');
+}
+
+/** The authority dsh sees on a proxied browser request (it binds its cookie to it). */
+function backendAuthority(be, req) {
+  return TRUST_MODE === 'origin-rewrite'
+    ? `127.0.0.1:${be.port}`
+    : String(req.headers.host ?? `127.0.0.1:${be.port}`);
+}
+
+function hasRequestCookie(req, name) {
+  const prefix = `${name}=`;
+  for (const part of String(req.headers.cookie ?? '').split(';')) {
+    if (part.trim().startsWith(prefix)) return true;
+  }
+  return false;
+}
+
+function isIndexPath(pathname) {
+  return pathname === '/' || pathname === '/index.html';
+}
+
+/** Record a launch token parsed from a backend's stdout and wake any waiters. */
+function setLaunchToken(be, token) {
+  be.launchToken = token;
+  for (const resolve of be.launchTokenWaiters.splice(0)) resolve(true);
+}
+
+/** Resolve true once the backend has printed its launch token, false after timeoutMs. */
+function waitLaunchToken(be, timeoutMs) {
+  if (be.launchToken) return Promise.resolve(true);
+  if (be.launchTokenUnavailable) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const waiter = (ok) => { clearTimeout(timer); resolve(ok); };
+    const timer = setTimeout(() => {
+      be.launchTokenUnavailable = true;
+      be.launchTokenWaiters = be.launchTokenWaiters.filter((w) => w !== waiter);
+      console.warn(`[hub] ${be.user}: dsh did not print its "dsh web: <url>?token=..." line; `
+        + 'index requests cannot be bridged and dsh will refuse them');
+      resolve(false);
+    }, timeoutMs);
+    be.launchTokenWaiters.push(waiter);
+  });
+}
+
+/**
+ * Spend the backend's launch token and return the Set-Cookie value dsh minted
+ * for `authority`, or null when no cookie came back.
+ */
+function mintDshSessionCookie(be, authority) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (value) => { if (!settled) { settled = true; resolve(value); } };
+    const req = http.request({
+      host: '127.0.0.1',
+      port: be.port,
+      method: 'GET',
+      path: `/?token=${encodeURIComponent(be.launchToken)}`,
+      setHost: false,
+      headers: { host: authority, connection: 'close' },
+    }, (res) => {
+      res.resume(); // only the Set-Cookie header matters
+      res.on('end', () => done(res.headers['set-cookie'] ?? null));
+      res.on('error', () => done(null));
+    });
+    req.on('error', () => done(null));
+    req.setTimeout(10_000, () => { req.destroy(); done(null); });
+    req.end();
+  });
+}
+
+/**
+ * Ensure the browser holds dsh's own session cookie, minting and relaying it
+ * through the backend's launch token when absent (or when `force` re-mints after
+ * dsh rejected a stale one).
+ * @returns true when this wrote the 303 carrying dsh's Set-Cookie.
+ */
+async function bridgeDshBrowserSession(req, res, be, { force = false } = {}) {
+  const authority = backendAuthority(be, req);
+  if (!force && hasRequestCookie(req, dshCookieName(authority))) return false;
+  if (!await waitLaunchToken(be, 5000)) return false;
+  const setCookie = await mintDshSessionCookie(be, authority);
+  if (!setCookie) return false;
+  res.writeHead(303, {
+    'cache-control': 'no-store',
+    'referrer-policy': 'no-referrer',
+    location: '/',
+    'set-cookie': setCookie,
+  });
+  res.end();
+  return true;
 }
 
 // ---------------------------------------------------------------- proxy -----
@@ -456,6 +588,28 @@ const proxy = httpProxy.createProxyServer({
 proxy.on('proxyRes', (proxyRes, req, res) => {
   const ct = String(proxyRes.headers['content-type'] ?? '');
   const url = String(req.url ?? '');
+  const reqPath = new URL(url, 'http://x').pathname;
+  const be = req.hubBackend;
+  // dsh refused the index with 401: the browser either has no dsh cookie yet or
+  // holds a stale one. Re-mint it from the launch token and redirect, instead of
+  // surfacing "reopen the URL printed by dsh web". The throttle stops a redirect
+  // loop if the freshly minted cookie is itself refused.
+  if (be && proxyRes.statusCode === 401 && req.method === 'GET'
+    && isIndexPath(reqPath) && Date.now() - be.bridgeAttemptAt > 5000) {
+    be.bridgeAttemptAt = Date.now();
+    proxyRes.resume(); // discard dsh's 401 body; this handler owns the response
+    bridgeDshBrowserSession(req, res, be, { force: true })
+      .then((handled) => {
+        if (handled || res.headersSent || res.writableEnded) return;
+        res.writeHead(401, { 'cache-control': 'no-store', 'content-type': 'text/plain; charset=utf-8' });
+        res.end('dsh web authentication required; reopen the URL printed by dsh web.\n');
+      })
+      .catch((err) => {
+        console.error('[hub] browser-session bridge failed:', err.message);
+        if (!res.headersSent) { res.writeHead(502); res.end('dsh-hub: browser-session bridge failed\n'); }
+      });
+    return;
+  }
   // Plugin bundles: patch the connection client's isLoopback gate in flight.
   const isPluginJs = /^\/plugins\/.+\.js(\?|$)/.test(url);
   if (isPluginJs) {
@@ -642,7 +796,7 @@ justify-content:center;padding-top:12rem}p{color:#8b97a3}</style></head>
 // The wire endpoint is `session/list` (slash, not the old `session.list`) and
 // its args travel as `payload.args._request`; a cached server-response is
 // republished under the caller's rpcId because the client rejects a mismatched
-// echo.
+// echo. Background refresh presents the same dsh browser cookie the hub mints.
 const SESSION_LIST_PATH = '/api/session/list';
 const RPC_CACHE_REVALIDATE_MS = 60_000;   // min gap between background refreshes (12MB responses; keep the hub event loop free)
 const RPC_CACHE_FAIL_BACKOFF_MS = 30_000; // pause after a failed refresh
@@ -804,6 +958,24 @@ function serveCachedSessionList(res, entry, rpcId) {
   }
 }
 
+/**
+ * Cookie header authenticating hub-internal /api calls. dsh's browser fence
+ * applies to loopback requests too, so prewarm/revalidate must present the same
+ * `dsh-auth-*` cookie a browser would; the hub mints its own from the backend's
+ * launch token and reuses it for that backend's lifetime.
+ * @returns the `name=value` pair, or null when no token/cookie is available.
+ */
+async function hubDshCookieHeader(be) {
+  if (be.internalCookie) return be.internalCookie;
+  if (!await waitLaunchToken(be, 5000)) return null;
+  const setCookie = await mintDshSessionCookie(be, `127.0.0.1:${be.port}`);
+  if (!setCookie) return null;
+  const raw = Array.isArray(setCookie) ? setCookie[0] : setCookie;
+  if (typeof raw !== 'string' || raw === '') return null;
+  be.internalCookie = raw.split(';')[0];
+  return be.internalCookie;
+}
+
 /** A cacheable session.list payload: non-empty 200 whose envelope parses and carries an items array. */
 function isCacheableSessionList(captured) {
   if (captured.status !== 200 || captured.body.length === 0) return false;
@@ -818,7 +990,11 @@ function isCacheableSessionList(captured) {
 async function revalidateSessionList(user, be, body, key) {
   const now = Date.now();
   try {
-    const captured = await forwardSessionList(be, { accept: 'application/json', 'content-type': 'application/json' }, body);
+    const cookie = await hubDshCookieHeader(be);
+    const headers = { accept: 'application/json', 'content-type': 'application/json' };
+    if (cookie) headers.cookie = cookie;
+    const captured = await forwardSessionList(be, headers, body);
+    if (captured.status === 401) be.internalCookie = null; // rotated secret: re-mint on the next attempt
     if (isCacheableSessionList(captured)) {
       const entry = { ...captured, nextRevalidateAt: now + RPC_CACHE_REVALIDATE_MS, inflight: false };
       rpcCache.set(key, entry);
@@ -911,6 +1087,11 @@ async function route(req, res) {
     be.lastActivity = Date.now();
     req.headers.origin = `http://127.0.0.1:${be.port}`;
     req.headers['accept-encoding'] = 'identity';
+    // Present the hub's own cookie for this backend, not the browser's: after a
+    // respawn the browser still carries the old port's cookie name and dsh would
+    // refuse it, while the hub always mints for the current authority.
+    const internalCookie = await hubDshCookieHeader(be);
+    if (internalCookie) req.headers.cookie = internalCookie;
     let captured;
     try {
       captured = await forwardSessionList(be, req.headers, body);
@@ -960,6 +1141,16 @@ async function route(req, res) {
     return;
   }
   be.lastActivity = Date.now();
+  req.hubBackend = be; // lets the proxy 401 handler re-mint dsh's session cookie
+  // First navigation of an authenticated session: mint dsh's own browser-session
+  // cookie before touching the backend, so the index never answers 401.
+  if (req.method === 'GET' && isIndexPath(url.pathname)) {
+    try {
+      if (await bridgeDshBrowserSession(req, res, be)) return;
+    } catch (err) {
+      console.error(`[hub] browser-session bridge failed for ${user}:`, err.message);
+    }
+  }
   if (TRUST_MODE === 'origin-rewrite') {
     // Legacy fallback: align Origin with the loopback Host changeOrigin sends;
     // cross-site protection is carried by the hub's SameSite cookie instead.
