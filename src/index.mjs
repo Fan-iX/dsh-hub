@@ -62,14 +62,11 @@ const TRUSTED_HOSTS = [
 function detectDshBin() {
   if (process.env.DSH_BIN) return process.env.DSH_BIN;
   const candidates = [
-    path.join(process.cwd(), 'deepseek-harness/apps/cli/lib/bin.js'),
-    path.resolve(__dirname, '../../deepseek-harness/apps/cli/lib/bin.js'),
-    '/usr/local/lib/dsh/apps/cli/lib/bin.js',
-    path.resolve(__dirname, '../node_modules/@deepseek-ai/dsh/lib/bin.js'),
-    '/usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js',
-    '/usr/local/lib64/node_modules/@deepseek-ai/dsh/lib/bin.js',
-    '/usr/lib/node_modules/@deepseek-ai/dsh/lib/bin.js',
-    '/usr/lib64/node_modules/@deepseek-ai/dsh/lib/bin.js',
+    // local installation with `npm install @deepseek-ai/dsh`
+    path.resolve(__dirname, '../node_modules/.bin/dsh'), 
+    // system global installation with `npm install -g @deepseek-ai/dsh`
+    '/usr/local/bin/dsh',
+    '/usr/bin/dsh',
   ];
   for (const c of candidates) {
     try { fs.accessSync(c, fs.constants.X_OK); return c; } catch { /* next */ }

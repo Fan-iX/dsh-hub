@@ -18,9 +18,9 @@ per-user plugin installs keep working.
 > 每用户自行安装插件均不受影响。
 
 ```
-browser ──http://<server-ip>:3080──▶ dsh-hub ──cookie──▶ 127.0.0.1:<port> ──▶ dsh (user A)
-                                        │                127.0.0.1:<port> ──▶ dsh (user B)
-                                        └─ spawn as uid/gid + iptables owner-guard
+browser -- http://<server-ip>:3080 --> dsh-hub -- cookie --> 127.0.0.1:<port> --> dsh (user A)
+                                          |                  127.0.0.1:<port> --> dsh (user B)
+                                          `- spawn as uid/gid + iptables owner-guard
 ```
 ## Quick start
 
@@ -29,10 +29,11 @@ git clone https://github.com/Mpaperlee/dsh-hub.git /opt/dsh-hub
 cd /opt/dsh-hub && npm install
 # optional: install `@deepseek-ai/dsh` within the same repo
 npm install @deepseek-ai/dsh
+# or globally
+sudo npm install -g @deepseek-ai/dsh
 
 # dev run (no root: no setuid/iptables, single-user semantics)
-DSH_BIN=/path/to/deepseek-harness/apps/cli/lib/bin.js HUB_PORT=3080 \
-  HUB_LOG_DIR=/tmp npm start
+DSH_BIN=/path/to/dsh HUB_PORT=3080 HUB_LOG_DIR=/tmp npm start
 ```
 
 Production (root, systemd):
@@ -49,7 +50,7 @@ username/password**, and get a private dsh instance.
 
 | Env | Default | Meaning |
 |---|---|---|
-| `DSH_BIN` | `$DSH_HUB_DIR/node_modules/@deepseek-ai/dsh/lib/bin.js` | dsh CLI entry (built checkout: `apps/cli/lib/bin.js`) |
+| `DSH_BIN` | `$DSH_HUB_DIR/node_modules/.bin/dsh` | dsh CLI entry |
 | `HUB_HOST` / `HUB_PORT` | `0.0.0.0` / `3080` | hub listen address |
 | `TRUST_MODE` | `origin-rewrite` | `trusted-host` forwards Host/Origin untouched (see trust model above) |
 | `TRUSTED_HOSTS` | auto (LAN IPv4s) | extra authorities for `--trusted-host` (hostnames/DNS names) |
@@ -60,8 +61,6 @@ username/password**, and get a private dsh instance.
 | `COOKIE_SECRET_FILE` | `$CWD/.cookie-secret` | HMAC secret (auto-generated, `0600`) |
 | `HUB_CLEAN_ON_STOP` | `1` | on `SIGTERM`/`SIGINT`/`SIGHUP`, stop instances and delete `$CWD/cache` + the cookie secret; `0` keeps them |
 | `SHUTDOWN_GRACE_MS` | `5000` | how long a backend may take to exit before it is `SIGKILL`ed |
-
-
 
 ## Architecture (the JupyterHub analogy)
 
