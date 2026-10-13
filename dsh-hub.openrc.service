@@ -1,0 +1,20 @@
+#!/sbin/openrc-run
+# dsh-hub - multi-user front for DeepSeek Harness.
+
+name="dsh-hub"
+description="multi-user front for DeepSeek Harness"
+: ${DSH_HUB_PIDFILE:=${RC_PREFIX%/}/run/${SVCNAME}.pid}
+: ${DSH_HUB_DIR:=${RC_PREFIX%/}/opt/dsh-hub}
+: ${DSH_HUB_DATA_DIR:=${RC_PREFIX%/}/var/lib/dsh-hub}
+: ${NODE_BINARY:=$(command -v node || echo /usr/bin/node)}
+
+command="${NODE_BINARY}"
+command_args="${DSH_HUB_DIR}/src/index.mjs"
+command_background="yes"
+pidfile="${DSH_HUB_PIDFILE}"
+directory="${DSH_HUB_DATA_DIR}"
+
+depend()
+{
+	need net
+}
