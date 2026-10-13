@@ -1,0 +1,141 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          dsh-hub
+# Required-Start:    $network $local_fs $remote_fs
+# Required-Stop:     $network $local_fs $remote_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: multi-user front for DeepSeek Harness
+# Description:       multi-user front for DeepSeek Harness: PAM auth,
+#                    one isolated dsh instance per user, cookie-routed
+#                    HTTP/WebSocket proxy.
+### END INIT INFO
+
+NAME="dsh-hub"
+ENTRYPOINT="src/index.mjs"
+
+[ -r "/etc/default/${NAME}" ] && . "/etc/default/${NAME}"
+[ -r "/etc/sysconfig/${NAME}" ] && . "/etc/sysconfig/${NAME}"
+
+: "${DSH_HUB_DIR:=/opt/dsh-hub}"
+: "${DSH_HUB_DATA_DIR:=/var/lib/dsh-hub}"
+: "${DSH_HUB_PIDFILE:=/run/${NAME}.pid}"
+: "${NODE_BINARY:=$(command -v node || echo /usr/bin/node)}"
+
+log()
+{
+	echo "${NAME}: $*"
+}
+
+warn()
+{
+	echo "${NAME}: $*" >&2
+}
+
+running_pid()
+{
+	local pid
+	[ -r "${DSH_HUB_PIDFILE}" ] || return 1
+	pid=$(cat "${DSH_HUB_PIDFILE}" 2>/dev/null)
+	[ -n "${pid}" ] || return 1
+	kill -0 "${pid}" 2>/dev/null || return 1
+	[ -r "/proc/${pid}/cmdline" ] || { echo "${pid}"; return 0; }
+	tr '\0' ' ' < "/proc/${pid}/cmdline" | grep -q "${ENTRYPOINT}" || return 1
+	echo "${pid}"
+}
+
+start()
+{
+	local pid
+
+	if pid=$(running_pid); then
+		log "already running (pid ${pid})"
+		return 0
+	fi
+
+	[ -x "${NODE_BINARY}" ] || {
+		warn "node not found: ${NODE_BINARY} (set NODE_BINARY in /etc/default/${NAME})"
+		return 1
+	}
+	[ -f "${DSH_HUB_DIR}/${ENTRYPOINT}" ] || {
+		warn "entry point not found: ${DSH_HUB_DIR}/${ENTRYPOINT}"
+		return 1
+	}
+
+	cd "${DSH_HUB_DATA_DIR}" || return 1
+	"${NODE_BINARY}" "${DSH_HUB_DIR}/${ENTRYPOINT}" &
+	pid=$!
+	echo "${pid}" > "${DSH_HUB_PIDFILE}"
+
+	return 0
+}
+
+stop()
+{
+	local STATUS=0
+	local pid
+
+	if ! pid=$(running_pid); then
+		if [ -e "${DSH_HUB_PIDFILE}" ]; then
+			warn "not running; removing stale ${DSH_HUB_PIDFILE}"
+			rm -f "${DSH_HUB_PIDFILE}"
+		else
+			log "not running"
+		fi
+		return 0
+	fi
+
+	log "stopping (pid ${pid})"
+	kill -TERM "${pid}" 2>/dev/null
+
+	local i=0
+	while kill -0 "${pid}" 2> /dev/null;  do
+		if [ $i = '60' ]; then
+			STATUS=2
+			break
+		fi
+		sleep 1
+		i=$(($i+1))
+	done
+	if kill -0 "${pid}" 2> /dev/null; then
+		return $STATUS
+	fi
+	rm -f "${DSH_HUB_PIDFILE}"
+	log "stopped"
+	return 0
+}
+
+status()
+{
+	local pid
+	if pid=$(running_pid); then
+		log "running (pid ${pid})"
+		return 0
+	fi
+	if [ -e "${DSH_HUB_PIDFILE}" ]; then
+		log "dead but pid file exists: ${DSH_HUB_PIDFILE}"
+		return 1
+	fi
+	log "not running"
+	return 3
+}
+
+case "$1" in
+	start)
+		start
+		;;
+	stop)
+		stop
+		;;
+	restart)
+		stop
+		start
+		;;
+	status)
+		status
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart|status}" >&2
+		exit 2
+		;;
+esac
