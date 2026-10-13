@@ -36,11 +36,46 @@ sudo npm install -g @deepseek-ai/dsh
 DSH_BIN=/path/to/dsh HUB_PORT=3080 HUB_LOG_DIR=/tmp npm start
 ```
 
-Production (root, systemd):
+Production (root) — install the unit that matches your init system.
+
+systemd:
 
 ```bash
 sudo cp dsh-hub.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now dsh-hub
+```
+
+OpenRC:
+
+```bash
+sudo install -m 0755 dsh-hub.openrc.service /etc/init.d/dsh-hub
+sudo rc-update add dsh-hub default
+sudo rc-service dsh-hub start
+```
+
+sysvinit:
+
+```bash
+sudo install -m 0755 dsh-hub.sysvinit.service /etc/init.d/dsh-hub
+sudo update-rc.d dsh-hub defaults   # Debian/Ubuntu
+sudo chkconfig --add dsh-hub        # RHEL/CentOS
+sudo service dsh-hub start
+```
+
+All three start the hub as root from `/var/lib/dsh-hub` — the working directory
+that holds the cookie secret and the session cache — and accept the
+[configuration](#configuration) environment variables. The hub's own defaults
+(`HUB_PORT=3080`, `HUB_LOG_DIR=/var/log/dsh-hub`) apply unless you override them
+in the init-system config file: `/etc/conf.d/dsh-hub` (OpenRC) or
+`/etc/default/dsh-hub` / `/etc/sysconfig/dsh-hub` (sysvinit). Those files also
+honour `DSH_HUB_DIR`, `DSH_HUB_DATA_DIR`, `DSH_HUB_PIDFILE` and `NODE_BINARY`.
+`openrc-run` and sysvinit pass on **exported** variables only:
+
+```sh
+# /etc/conf.d/dsh-hub  ·  /etc/default/dsh-hub
+export HUB_PORT=3080
+export HUB_LOG_DIR=/var/log/dsh-hub
+export IDLE_CULL_MS=0           # 0 = never cull idle backends
 ```
 
 Users browse to `http://<server-ip>:3080`, log in with their **system
@@ -165,7 +200,9 @@ the hub logs a warning and passes dsh's own 401 through unchanged.
   restarts.
 - Conversations survive browser close: goal/server-side drivers keep running
   in the spawned dsh process; re-login reattaches to the same instance.
-- `sudo systemctl restart dsh-hub` after config changes.
+- Restart after config changes: `sudo systemctl restart dsh-hub` (systemd),
+  `sudo rc-service dsh-hub restart` (OpenRC), `sudo service dsh-hub restart`
+  (sysvinit).
 - Non-root runs are degraded (dev) mode: no setuid spawn, no iptables guard.
 
 ## License
