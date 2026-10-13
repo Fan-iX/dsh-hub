@@ -198,23 +198,23 @@ function recordFailure(ip) {
 }
 
 // Two PAM paths:
-//  1. native `authenticate-pam` (optionalDependency; needs libpam0g-dev to build)
+//  1. native `node-linux-pam` (optionalDependency; needs libpam to build)
 //  2. `su` fallback: spawn `su <user> -c 'exit 0'` as an unprivileged uid —
 //     su then verifies the TARGET user's password through PAM. Zero native
 //     deps; failed attempts land in the normal auth log.
 let pamNative = null;
-try { pamNative = (await import('authenticate-pam')).default; } catch { /* optional */ }
+try { pamNative = (await import('node-linux-pam')).default; } catch { /* optional */ }
 
-function pamAuthenticate(user, password) {
+function pamAuthenticate(username, password) {
   if (pamNative) {
     return new Promise((resolve) => {
-      pamNative.authenticate(user, password, (err) => resolve(!err));
+      pamNative.pamAuthenticate({ username, password }, (err) => resolve(!err));
     });
   }
   return new Promise((resolve) => {
     const opts = { stdio: ['pipe', 'ignore', 'ignore'] };
     if (IS_ROOT) opts.uid = 65534; // nobody: non-root su prompts via PAM
-    const child = spawn('su', [user, '-c', 'exit 0'], opts);
+    const child = spawn('su', [username, '-c', 'exit 0'], opts);
     let done = false;
     const finish = (ok) => {
       if (done) return;

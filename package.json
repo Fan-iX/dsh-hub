@@ -8,13 +8,13 @@
     "start": "node src/index.mjs"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "dependencies": {
-    "http-proxy": "^1.18.1"
+    "http-proxy": "^1.18.0"
   },
   "optionalDependencies": {
-    "authenticate-pam": "^1.0.2"
+    "node-linux-pam": "^0.2.1"
   },
   "license": "MIT",
   "repository": {
