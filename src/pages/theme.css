@@ -1,0 +1,218 @@
+/* dsh-hub's own pages, themed after dsh's web UI.
+ *
+ * Values mirror packages/client/ui-theme/src/styles: the neutral-bluish
+ * surfaces, the deepseek accents, the radius scale, and the Montserrat-free
+ * system font stack. Light is the default; dark follows the browser setting the
+ * same way dsh's `data-ds-dark-theme` palette does. Kept as a real stylesheet
+ * file and inlined into each page by pages.mjs. */
+
+:root {
+  color-scheme: light dark;
+  --dsh-font: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  --dsh-bg: rgb(255 255 255);
+  --dsh-surface: rgb(255 255 255);
+  --dsh-field: rgb(249 250 251);
+  --dsh-border: rgb(0 0 0 / 10%);
+  --dsh-border-strong: rgb(0 0 0 / 16%);
+  --dsh-text: rgb(15 17 21);
+  --dsh-text-2: rgb(97 102 107);
+  --dsh-text-3: rgb(129 133 140);
+  --dsh-accent: rgb(57 100 254);
+  --dsh-accent-hover: rgb(47 85 230);
+  --dsh-accent-ring: rgb(57 100 254 / 22%);
+  --dsh-danger: rgb(236 19 19);
+  --dsh-shadow: 0 10px 34px rgb(15 17 21 / 8%), 0 1px 2px rgb(15 17 21 / 6%);
+  --dsh-radius-card: 20px;
+  --dsh-radius-field: 12px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --dsh-bg: rgb(21 21 23);
+    --dsh-surface: rgb(35 35 36);
+    --dsh-field: rgb(27 27 28);
+    --dsh-border: rgb(255 255 255 / 12%);
+    --dsh-border-strong: rgb(255 255 255 / 20%);
+    --dsh-text: rgb(249 250 251);
+    --dsh-text-2: rgb(207 211 214);
+    --dsh-text-3: rgb(173 178 184);
+    --dsh-accent: rgb(122 170 255);
+    --dsh-accent-hover: rgb(96 165 250);
+    --dsh-accent-ring: rgb(122 170 255 / 28%);
+    --dsh-danger: rgb(242 90 90);
+    --dsh-shadow: 0 10px 34px rgb(0 0 0 / 45%), 0 1px 2px rgb(0 0 0 / 30%);
+  }
+}
+
+* { box-sizing: border-box; }
+
+/* dsh curves every rounded surface along superellipse(1.5); full-round shapes
+ * opt back into a circular corner. */
+@supports (corner-shape: superellipse(1.5)) {
+  *,
+  *::before,
+  *::after { corner-shape: superellipse(1.5); }
+  .spinner,
+  .lang-opt { corner-shape: round; }
+}
+
+html,
+body { height: 100%; }
+
+body {
+  margin: 0;
+  padding: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--dsh-font);
+  background: var(--dsh-bg);
+  color: var(--dsh-text);
+  -webkit-font-smoothing: antialiased;
+}
+
+.card {
+  width: 100%;
+  max-width: 384px;
+  padding: 32px 32px 22px;
+  background: var(--dsh-surface);
+  border: 1px solid var(--dsh-border);
+  border-radius: var(--dsh-radius-card);
+  box-shadow: var(--dsh-shadow);
+}
+
+.brand {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 22px;
+  text-align: center;
+}
+
+.mark {
+  width: 44px;
+  height: 44px;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  border-radius: 14px;
+  background: linear-gradient(135deg, #3964fe, #6dccff);
+}
+
+h1 {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.sub {
+  margin: 6px 0 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--dsh-text-3);
+}
+
+label {
+  display: block;
+  margin: 14px 0 6px;
+  font-size: 12px;
+  color: var(--dsh-text-2);
+}
+
+input {
+  width: 100%;
+  padding: 10px 12px;
+  font: inherit;
+  font-size: 14px;
+  color: var(--dsh-text);
+  background: var(--dsh-field);
+  border: 1px solid var(--dsh-border);
+  border-radius: var(--dsh-radius-field);
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+input:focus {
+  border-color: var(--dsh-accent);
+  box-shadow: 0 0 0 3px var(--dsh-accent-ring);
+}
+
+button {
+  width: 100%;
+  margin-top: 20px;
+  padding: 11px 16px;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--dsh-accent);
+  border: 0;
+  border-radius: var(--dsh-radius-field);
+  cursor: pointer;
+  transition: background 0.15s, transform 0.1s;
+}
+
+button:hover { background: var(--dsh-accent-hover); }
+button:active { transform: translateY(1px); }
+button:focus-visible { outline: 2px solid var(--dsh-accent); outline-offset: 2px; }
+
+.err {
+  min-height: 20px;
+  margin-top: 12px;
+  font-size: 13px;
+  color: var(--dsh-danger);
+}
+
+.lang {
+  display: flex;
+  justify-content: center;
+  gap: 4px;
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--dsh-border);
+}
+
+.lang-opt {
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--dsh-text-3);
+  text-decoration: none;
+  border-radius: 999px;
+  transition: background 0.15s, color 0.15s;
+}
+
+.lang-opt:hover { color: var(--dsh-text); background: var(--dsh-field); }
+.lang-opt.active { color: var(--dsh-text); background: var(--dsh-field); font-weight: 600; }
+.lang-opt:focus-visible { outline: 2px solid var(--dsh-accent); outline-offset: 2px; }
+
+/* Cold-start screen: same card, centered spinner instead of a form. */
+.start { text-align: center; padding: 36px 32px; }
+.start h1 { font-size: 16px; }
+.start .sub { margin-top: 8px; }
+.brandline { margin-top: 18px; font-size: 12px; opacity: 0.85; }
+
+.spinner {
+  width: 34px;
+  height: 34px;
+  margin: 0 auto 20px;
+  border: 3px solid var(--dsh-border-strong);
+  border-top-color: var(--dsh-accent);
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner { animation-duration: 2.4s; }
+  button { transition: none; }
+}
+
+/* The dark-mode accent is a light blue, so the label flips to near-black for
+ * contrast (the light-mode accent keeps a white label). */
+@media (prefers-color-scheme: dark) {
+  button { color: rgb(15 17 21); }
+}

@@ -5,7 +5,8 @@ import { backends, getOrCreateBackend } from './backends.mjs';
 import { proxy } from './proxy.mjs';
 import { bridgeDshBrowserSession, hubDshCookieHeader, isIndexPath } from './browser-session.mjs';
 import { sendHtml, readRequestBody } from './http.mjs';
-import { STARTING_PAGE, loginPage } from './pages.mjs';
+import { localeFromRequest, languageCookie, t } from './i18n.mjs';
+import { loginPage, startingPage } from './pages.mjs';
 import { lookupUser } from './users.mjs';
 import { handleLogin, handleLogout, sessionUser } from './auth.mjs';
 import {
@@ -33,11 +34,20 @@ function startBackendInBackground(user) {
     .finally(() => spawnInflight.delete(user));
 }
 
+/** Locale headers for a hub-rendered page, persisting an explicit `?lang=`. */
+function pageHeaders(req, locale) {
+  const headers = { 'content-language': locale, vary: 'Accept-Language' };
+  const cookie = languageCookie(req);
+  if (cookie !== undefined) headers['set-cookie'] = cookie;
+  return headers;
+}
+
 export async function route(req, res) {
   const url = new URL(req.url, 'http://x');
 
   if (url.pathname === '/hub/login' && req.method === 'GET') {
-    sendHtml(res, 200, loginPage(''));
+    const locale = localeFromRequest(req);
+    sendHtml(res, 200, loginPage(locale, ''), pageHeaders(req, locale));
     return;
   }
   if (url.pathname === '/hub/login' && req.method === 'POST') {
@@ -124,18 +134,20 @@ export async function route(req, res) {
   // an API call cannot hang for the whole spawn either.
   let be = backends.get(user);
   if (!be || !be.child || be.child.exitCode !== null || be.starting) {
+    const locale = localeFromRequest(req);
     const failure = spawnFailures.get(user);
     if (failure !== undefined) {
       spawnFailures.delete(user);
-      sendHtml(res, 503, `<pre>dsh-hub: fail to launch\n${failure}</pre>`);
+      sendHtml(res, 503, `<pre>${t(locale, 'error.spawnFailed')}\n${failure}</pre>`,
+        pageHeaders(req, locale));
       return;
     }
     startBackendInBackground(user);
     if (req.method === 'GET' && isIndexPath(url.pathname)) {
-      sendHtml(res, 200, STARTING_PAGE);
+      sendHtml(res, 200, startingPage(locale), pageHeaders(req, locale));
     } else {
-      res.writeHead(503, { 'retry-after': '3', 'content-type': 'text/plain; charset=utf-8' });
-      res.end('dsh-hub: dsh instance is starting\n');
+      res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8', 'retry-after': '3' });
+      res.end(`${t(locale, 'error.starting')}\n`);
     }
     return;
   }

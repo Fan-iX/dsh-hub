@@ -9,6 +9,7 @@ import { spawn } from 'node:child_process';
 
 import { AUTH_LOG_FILE, CFG, IS_ROOT, SECRET_PATH } from './config.mjs';
 import { readBody, sendHtml, urlencoded } from './http.mjs';
+import { localeFromRequest, t } from './i18n.mjs';
 import { loginPage } from './pages.mjs';
 import { lookupUser } from './users.mjs';
 
@@ -256,20 +257,24 @@ function clientIp(req, peer = normalizeIp(req.socket.remoteAddress)) {
 }
 
 export async function handleLogin(req, res) {
+  const locale = localeFromRequest(req);
+  const pageHeaders = { 'content-language': locale, vary: 'Accept-Language' };
   const peer = normalizeIp(req.socket.remoteAddress);
   const ip = clientIp(req, peer);
   const via = ip === peer ? '' : ` proxy=${logToken(peer)}`;
   const wait = loginBlockSeconds(ip);
   if (wait > 0) {
     audit(`login blocked ip=${logToken(ip)} retry_after=${wait}s`);
-    const text = wait < 60 ? `${wait} 秒` : `${Math.ceil(wait / 60)} 分钟`;
-    sendHtml(res, 429, loginPage(`尝试过多,请 ${text}后再试`), { 'retry-after': String(wait) });
+    const amount = t(locale, wait < 60 ? 'wait.seconds' : 'wait.minutes',
+      { n: wait < 60 ? wait : Math.ceil(wait / 60) });
+    sendHtml(res, 429, loginPage(locale, t(locale, 'error.tooManyAttempts', { wait: amount })),
+      { ...pageHeaders, 'retry-after': String(wait) });
     return;
   }
   const { username, password } = urlencoded(await readBody(req));
   if (!username || !password) {
     audit(`login rejected reason=missing-credentials ip=${logToken(ip)}${via}`);
-    sendHtml(res, 401, loginPage('请输入用户名和密码'));
+    sendHtml(res, 401, loginPage(locale, t(locale, 'error.missingCredentials')), pageHeaders);
     return;
   }
   const info = lookupUser(username);
@@ -284,7 +289,7 @@ export async function handleLogin(req, res) {
     const blocked = loginBlockSeconds(ip);
     audit(`login failed user=${logToken(username)} reason=${reason} ip=${logToken(ip)}${via}`
       + (blocked > 0 ? ` blocked_for=${blocked}s` : ''));
-    sendHtml(res, 401, loginPage('用户名或密码错误'));
+    sendHtml(res, 401, loginPage(locale, t(locale, 'error.badCredentials')), pageHeaders);
     return;
   }
   audit(`login ok user=${logToken(username)} ip=${logToken(ip)}${via}`);

@@ -1,36 +1,33 @@
 <!doctype html>
-<html lang="zh">
+<html lang="{{lang}}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>dsh-hub login</title>
-<style>
-  :root { color-scheme: dark; }
-  body { font-family: system-ui, sans-serif; background: #101418; color: #e6e6e6;
-         display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
-  .card { background: #1a2027; padding: 2.2rem 2.6rem; border-radius: 12px; width: 22rem;
-          box-shadow: 0 8px 40px rgba(0,0,0,.45); }
-  h1 { font-size: 1.25rem; margin: 0 0 .3rem; }
-  p.sub { color: #8b97a3; font-size: .85rem; margin: 0 0 1.6rem; }
-  label { display: block; font-size: .8rem; color: #8b97a3; margin: .9rem 0 .25rem; }
-  input { width: 100%; box-sizing: border-box; padding: .55rem .7rem; border-radius: 8px;
-          border: 1px solid #2c3641; background: #101418; color: inherit; font-size: .95rem; }
-  button { margin-top: 1.5rem; width: 100%; padding: .6rem; border: 0; border-radius: 8px;
-           background: #3b82f6; color: #fff; font-size: .95rem; cursor: pointer; }
-  button:hover { background: #2f6fe0; }
-  .err { color: #f87171; font-size: .85rem; min-height: 1.2em; margin-top: 1rem; }
-</style>
+<title>{{title}}</title>
+<style>{{style}}</style>
 </head>
 <body>
-  <form class="card" method="post" action="/hub/login">
-    <h1>DeepSeek Harness</h1>
-    <p class="sub">使用服务器系统账号登录(每用户独立隔离实例)</p>
-    <label for="u">用户名</label>
-    <input id="u" name="username" autocomplete="username" autofocus required>
-    <label for="p">密码</label>
-    <input id="p" name="password" type="password" autocomplete="current-password" required>
-    <div class="err">__MSG__</div>
-    <button type="submit">登录</button>
-  </form>
+  <main class="card">
+    <header class="brand">
+      <div class="mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" aria-hidden="true">
+          <path d="M12 2.4l2.5 6.3 6.3 2.5-6.3 2.5L12 20l-2.5-6.3L3.2 11.2l6.3-2.5L12 2.4z" fill="currentColor"/>
+        </svg>
+      </div>
+      <div>
+        <h1>{{brand}}</h1>
+        <p class="sub">{{subtitle}}</p>
+      </div>
+    </header>
+    <form method="post" action="/hub/login">
+      <label for="u">{{username}}</label>
+      <input id="u" name="username" autocomplete="username" autofocus required>
+      <label for="p">{{password}}</label>
+      <input id="p" name="password" type="password" autocomplete="current-password" required>
+      <div class="err" role="alert">{{message}}</div>
+      <button type="submit">{{submit}}</button>
+    </form>
+    <nav class="lang" aria-label="{{langLabel}}">{{langSwitch}}</nav>
+  </main>
 </body>
 </html>
