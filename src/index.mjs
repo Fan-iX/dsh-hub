@@ -21,119 +21,16 @@ import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { networkInterfaces } from 'node:os';
 import { spawn, execFileSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
 
 import httpProxy from 'http-proxy';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-// ---------------------------------------------------------------- config ----
-
-function int(v, dflt) { const n = Number(v); return Number.isInteger(n) && n > 0 ? n : dflt; }
-function intOrZero(v, dflt) { const n = Number(v); return Number.isInteger(n) && n >= 0 ? n : dflt; }
-
-// Trust modes:
-//  - 'origin-rewrite' (default): proxy rewrites Host (changeOrigin) and Origin
-//    to loopback; CSRF protection is carried by the hub's SameSite=Lax cookie.
-//    This is the ONLY mode that works behind a loopback-binding proxy: dsh's
-//    RPC host empties trustedHosts for loopback-authority /api channels
-//    (rpc-host.ts: `authority === 'loopback' ? [] : trustedHosts`), so
-//    --trusted-host cannot grant non-loopback Hosts there.
-//  - 'trusted-host': spawn dsh with its official `--trusted-host` flag and
-//    forward Host/Origin untouched. Only works when the fence actually feeds
-//    the flag to the channel (direct LAN binds), kept for future dsh support
-//    of proxied deployments.
-const TRUST_MODE = process.env.TRUST_MODE === 'trusted-host' ? 'trusted-host' : 'origin-rewrite';
-
-function lanIpv4s() {
-  return Object.values(networkInterfaces()).flat()
-    .filter((i) => i && i.family === 'IPv4' && !i.internal)
-    .map((i) => i.address);
-}
-
-const TRUSTED_HOSTS = [
-  ...lanIpv4s(),
-  ...(process.env.TRUSTED_HOSTS ?? '')
-    .split(',').map((s) => s.trim()).filter(Boolean),
-];
-
-function detectDshBin() {
-  if (process.env.DSH_BIN) return process.env.DSH_BIN;
-  const candidates = [
-    // local installation with `npm install @deepseek-ai/dsh`
-    path.resolve(__dirname, '../node_modules/.bin/dsh'), 
-    // system global installation with `npm install -g @deepseek-ai/dsh`
-    '/usr/local/bin/dsh',
-    '/usr/bin/dsh',
-  ];
-  for (const c of candidates) {
-    try { fs.accessSync(c, fs.constants.X_OK); return c; } catch { /* next */ }
-  }
-  console.error(
-    '[hub] FATAL: dsh binary not found. Set DSH_BIN to the dsh CLI entry\n' +
-    '[hub] (a built checkout: <repo>/apps/cli/lib/bin.js). Detected candidates:\n' +
-    candidates.map((c) => `        ${c}`).join('\n'));
-  process.exit(1);
-}
-
-const CFG = {
-  hubHost: process.env.HUB_HOST ?? '0.0.0.0',
-  hubPort: int(process.env.HUB_PORT, 3080),
-  dshBin: detectDshBin(),
-  sessionTtlMs: int(process.env.SESSION_TTL_MS, 7 * 24 * 3600 * 1000),
-  // 0 disables culling entirely — backends keep running with the browser
-  // closed, JupyterHub/tmux-style. Pick a positive value to reap idle ones.
-  idleCullMs: intOrZero(process.env.IDLE_CULL_MS, 4 * 3600 * 1000),
-  spawnTimeoutMs: int(process.env.SPAWN_TIMEOUT_MS, 60_000),
-  cookieName: 'dshhub_session',
-  // Optional comma-separated allow-list of usernames. Empty = all system users.
-  allowUsers: (process.env.ALLOW_USERS ?? '')
-    .split(',').map((s) => s.trim()).filter(Boolean),
-  logDir: process.env.HUB_LOG_DIR ?? '/var/log/dsh-hub',
-  // On SIGTERM/SIGINT/SIGHUP: stop every spawned instance, then delete the
-  // persisted session-list cache and the cookie-signing secret. Set
-  // HUB_CLEAN_ON_STOP=0 to keep them (a plain restart should not log every
-  // browser out). The grace period bounds how long a backend may take to exit
-  // before it is SIGKILLed.
-  cleanOnStop: process.env.HUB_CLEAN_ON_STOP !== '0',
-  shutdownGraceMs: int(process.env.SHUTDOWN_GRACE_MS, 5000),
-  // Login guard: failures are counted per client IP inside a sliding window.
-  // Reaching AUTH_MAX_FAILURES within AUTH_WINDOW_MS answers 429 until the
-  // oldest counted failure ages out of the window.
-  authWindowMs: int(process.env.AUTH_WINDOW_MS, 10 * 60 * 1000),
-  authMaxFailures: int(process.env.AUTH_MAX_FAILURES, 5),
-  // Comma-separated IPs/CIDRs whose X-Forwarded-For / X-Real-IP may be trusted.
-  // Empty (the default) always uses the TCP peer address and ignores both.
-  trustedProxies: (process.env.TRUSTED_PROXIES ?? '')
-    .split(',').map((s) => s.trim()).filter(Boolean),
-};
-
-// Append-only authentication audit log: one stable line per login outcome,
-// tagged with the resolved client IP, so an external log-driven banner can
-// filter and ban without the hub keeping its own ban list.
-const AUTH_LOG_FILE = process.env.HUB_AUTH_LOG ?? path.join(CFG.logDir, 'auth.log');
-
-const IS_ROOT = process.getuid?.() === 0;
-const IPTABLES = IS_ROOT && hasBin('iptables');
-
-function hasBin(name) {
-  const { statSync } = fs;
-  for (const dir of ['/usr/sbin', '/usr/bin', '/sbin', '/bin']) {
-    try { statSync(`${dir}/${name}`); return true; } catch { /* keep looking */ }
-  }
-  return false;
-}
+import {
+  AUTH_LOG_FILE, CACHE_DIR, CFG, IPTABLES, IS_ROOT, SECRET_PATH, TRUSTED_HOSTS, TRUST_MODE,
+} from './config.mjs';
 
 // ----------------------------------------------------------- cookie secret --
 
-// Runtime state (the signing secret and the session-list cache) lives in the
-// launch directory — the service's WorkingDirectory — not in the checkout,
-// which may be read-only or shared after deployment. Both paths are therefore
-// resolved from the process working directory, not relative to this module.
-const RUNTIME_DIR = process.cwd();
-const SECRET_PATH = process.env.COOKIE_SECRET_FILE ?? path.join(RUNTIME_DIR, '.cookie-secret');
 let SECRET;
 {
   try {
@@ -956,7 +853,6 @@ const rpcCache = new Map(); // key -> { status, headers, body, nextRevalidateAt,
 const RPC_CACHE_MAX = 500;
 const prewarmInflight = new Set();
 // Cache survives hub restarts: entries persist under <cwd>/cache/session-list-<hash>.json.
-const CACHE_DIR = path.join(RUNTIME_DIR, 'cache');
 const CACHE_PERSIST_GAP_MS = 300_000;     // throttle disk writes per key (16MB base64 files; async, off the hot path)
 const STANDARD_SESSION_LIST_BODY = Buffer.from(JSON.stringify({
   type: 'client-request', rpcId: 'hub-prewarm', method: 'session/list',
