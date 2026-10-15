@@ -28,6 +28,8 @@ import httpProxy from 'http-proxy';
 import {
   AUTH_LOG_FILE, CACHE_DIR, CFG, IPTABLES, IS_ROOT, SECRET_PATH, TRUSTED_HOSTS, TRUST_MODE,
 } from './config.mjs';
+import { readBody, readRequestBody, sanitizeForwardHeaders, sendHtml, urlencoded } from './http.mjs';
+import { STARTING_PAGE, loginPage } from './pages.mjs';
 
 // ----------------------------------------------------------- cookie secret --
 
@@ -626,48 +628,6 @@ proxy.on('error', (err, req, res) => {
 
 // ---------------------------------------------------------------- pages -----
 
-function sendHtml(res, status, body, headers = {}) {
-  res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', ...headers });
-  res.end(body);
-}
-
-const LOGIN_PAGE = `<!doctype html>
-<html lang="zh">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>dsh-hub login</title>
-<style>
-  :root { color-scheme: dark; }
-  body { font-family: system-ui, sans-serif; background: #101418; color: #e6e6e6;
-         display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
-  .card { background: #1a2027; padding: 2.2rem 2.6rem; border-radius: 12px; width: 22rem;
-          box-shadow: 0 8px 40px rgba(0,0,0,.45); }
-  h1 { font-size: 1.25rem; margin: 0 0 .3rem; }
-  p.sub { color: #8b97a3; font-size: .85rem; margin: 0 0 1.6rem; }
-  label { display: block; font-size: .8rem; color: #8b97a3; margin: .9rem 0 .25rem; }
-  input { width: 100%; box-sizing: border-box; padding: .55rem .7rem; border-radius: 8px;
-          border: 1px solid #2c3641; background: #101418; color: inherit; font-size: .95rem; }
-  button { margin-top: 1.5rem; width: 100%; padding: .6rem; border: 0; border-radius: 8px;
-           background: #3b82f6; color: #fff; font-size: .95rem; cursor: pointer; }
-  button:hover { background: #2f6fe0; }
-  .err { color: #f87171; font-size: .85rem; min-height: 1.2em; margin-top: 1rem; }
-</style>
-</head>
-<body>
-  <form class="card" method="post" action="/hub/login">
-    <h1>DeepSeek Harness</h1>
-    <p class="sub">使用服务器系统账号登录(每用户独立隔离实例)</p>
-    <label for="u">用户名</label>
-    <input id="u" name="username" autocomplete="username" autofocus required>
-    <label for="p">密码</label>
-    <input id="p" name="password" type="password" autocomplete="current-password" required>
-    <div class="err">__MSG__</div>
-    <button type="submit">登录</button>
-  </form>
-</body>
-</html>`;
-
 // -------------------------------------------------------------- handlers ----
 
 // ------------------------------------------------------------ client IP -----
@@ -757,24 +717,6 @@ function clientIp(req, peer = normalizeIp(req.socket.remoteAddress)) {
   return peer;
 }
 
-function readBody(req, limit = 64 * 1024) {
-  return new Promise((resolve, reject) => {
-    let size = 0; const chunks = [];
-    req.on('data', (c) => {
-      size += c.length;
-      if (size > limit) { reject(new Error('body too large')); req.destroy(); return; }
-      chunks.push(c);
-    });
-    req.on('end', () => resolve(Buffer.concat(chunks).toString()));
-    req.on('error', reject);
-  });
-}
-
-function urlencoded(body) {
-  const params = new URLSearchParams(body);
-  return { username: params.get('username') ?? '', password: params.get('password') ?? '' };
-}
-
 async function handleLogin(req, res) {
   const peer = normalizeIp(req.socket.remoteAddress);
   const ip = clientIp(req, peer);
@@ -783,13 +725,13 @@ async function handleLogin(req, res) {
   if (wait > 0) {
     audit(`login blocked ip=${logToken(ip)} retry_after=${wait}s`);
     const text = wait < 60 ? `${wait} 秒` : `${Math.ceil(wait / 60)} 分钟`;
-    sendHtml(res, 429, LOGIN_PAGE.replace('__MSG__', `尝试过多,请 ${text}后再试`), { 'retry-after': String(wait) });
+    sendHtml(res, 429, loginPage(`尝试过多,请 ${text}后再试`), { 'retry-after': String(wait) });
     return;
   }
   const { username, password } = urlencoded(await readBody(req));
   if (!username || !password) {
     audit(`login rejected reason=missing-credentials ip=${logToken(ip)}${via}`);
-    sendHtml(res, 401, LOGIN_PAGE.replace('__MSG__', '请输入用户名和密码'));
+    sendHtml(res, 401, loginPage('请输入用户名和密码'));
     return;
   }
   const info = lookupUser(username);
@@ -804,7 +746,7 @@ async function handleLogin(req, res) {
     const blocked = loginBlockSeconds(ip);
     audit(`login failed user=${logToken(username)} reason=${reason} ip=${logToken(ip)}${via}`
       + (blocked > 0 ? ` blocked_for=${blocked}s` : ''));
-    sendHtml(res, 401, LOGIN_PAGE.replace('__MSG__', '用户名或密码错误'));
+    sendHtml(res, 401, loginPage('用户名或密码错误'));
     return;
   }
   audit(`login ok user=${logToken(username)} ip=${logToken(ip)}${via}`);
@@ -823,12 +765,6 @@ function handleLogout(req, res) {
   });
   res.end();
 }
-
-const STARTING_PAGE = `<!doctype html><html lang="zh"><head><meta charset="utf-8">
-<meta http-equiv="refresh" content="3"><title>starting…</title>
-<style>body{font-family:system-ui;background:#101418;color:#e6e6e6;display:flex;
-justify-content:center;padding-top:12rem}p{color:#8b97a3}</style></head>
-<body><p>正在为你的账号启动 dsh 实例,首次约需 10 秒,即将自动刷新…</p></body></html>`;
 
 // ------------------------------------------- /api/session/list response cache --
 // dsh's session/list recomputes projections for every session (zstd-decode of
@@ -929,26 +865,6 @@ function loadPersistedCache() {
     if (err.code !== 'ENOENT') console.error('[hub] session.list cache dir read failed:', err.message);
   }
   if (rpcCache.size > 0) console.log(`[hub] loaded ${rpcCache.size} persisted session.list cache entries`);
-}
-
-function readRequestBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    req.on('data', (c) => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
-}
-
-function sanitizeForwardHeaders(headers, bePort) {
-  const out = {};
-  for (const [k, v] of Object.entries(headers)) {
-    const key = k.toLowerCase();
-    if (['connection', 'transfer-encoding', 'upgrade', 'keep-alive', 'proxy-connection', 'te', 'content-length', 'host'].includes(key)) continue;
-    out[k] = v;
-  }
-  out.host = `127.0.0.1:${bePort}`;
-  return out;
 }
 
 function forwardSessionList(be, headers, body) {
@@ -1097,7 +1013,7 @@ async function route(req, res) {
   const url = new URL(req.url, 'http://x');
 
   if (url.pathname === '/hub/login' && req.method === 'GET') {
-    sendHtml(res, 200, LOGIN_PAGE.replace('__MSG__', ''));
+    sendHtml(res, 200, loginPage(''));
     return;
   }
   if (url.pathname === '/hub/login' && req.method === 'POST') {
