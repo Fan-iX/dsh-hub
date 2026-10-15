@@ -3,7 +3,7 @@
 import { TRUST_MODE } from './config.mjs';
 import { backends, getOrCreateBackend } from './backends.mjs';
 import { proxy } from './proxy.mjs';
-import { bridgeDshBrowserSession, isIndexPath } from './browser-session.mjs';
+import { bridgeDshBrowserSession, hubDshCookieHeader, isIndexPath } from './browser-session.mjs';
 import { sendHtml, readRequestBody } from './http.mjs';
 import { STARTING_PAGE, loginPage } from './pages.mjs';
 import { lookupUser } from './users.mjs';
