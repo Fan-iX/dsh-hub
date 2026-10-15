@@ -99,7 +99,21 @@ const CFG = {
   // before it is SIGKILLed.
   cleanOnStop: process.env.HUB_CLEAN_ON_STOP !== '0',
   shutdownGraceMs: int(process.env.SHUTDOWN_GRACE_MS, 5000),
+  // Login guard: failures are counted per client IP inside a sliding window.
+  // Reaching AUTH_MAX_FAILURES within AUTH_WINDOW_MS answers 429 until the
+  // oldest counted failure ages out of the window.
+  authWindowMs: int(process.env.AUTH_WINDOW_MS, 10 * 60 * 1000),
+  authMaxFailures: int(process.env.AUTH_MAX_FAILURES, 5),
+  // Comma-separated IPs/CIDRs whose X-Forwarded-For / X-Real-IP may be trusted.
+  // Empty (the default) always uses the TCP peer address and ignores both.
+  trustedProxies: (process.env.TRUSTED_PROXIES ?? '')
+    .split(',').map((s) => s.trim()).filter(Boolean),
 };
+
+// Append-only authentication audit log: one stable line per login outcome,
+// tagged with the resolved client IP, so an external log-driven banner can
+// filter and ban without the hub keeping its own ban list.
+const AUTH_LOG_FILE = process.env.HUB_AUTH_LOG ?? path.join(CFG.logDir, 'auth.log');
 
 const IS_ROOT = process.getuid?.() === 0;
 const IPTABLES = IS_ROOT && hasBin('iptables');
@@ -181,20 +195,81 @@ function lookupUser(user) {
 
 // ----------------------------------------------------------------- PAM ------
 
-const LOGIN_ATTEMPTS = new Map(); // ip -> {count, until}
-function rateLimited(ip) {
-  const now = Date.now();
-  const rec = LOGIN_ATTEMPTS.get(ip);
-  if (!rec) return false;
-  if (rec.until > now) return true;
-  if (rec.until !== 0 && rec.until <= now) LOGIN_ATTEMPTS.delete(ip);
-  return false;
+// Sliding-window login guard: one ascending array of failure timestamps per
+// client IP. Memory stays bounded because each array keeps at most
+// AUTH_MAX_FAILURES entries (more is irrelevant once blocked) and a sweep drops
+// IPs whose window has fully aged out.
+const LOGIN_ATTEMPTS = new Map(); // ip -> ascending failure timestamps
+const AUTH_TRACKED_MAX = 100_000;
+
+function pruneFailures(list, now) {
+  const cutoff = now - CFG.authWindowMs;
+  let drop = 0;
+  while (drop < list.length && list[drop] <= cutoff) drop++;
+  if (drop > 0) list.splice(0, drop);
+  return list;
 }
+
+/** Seconds this IP must wait before another attempt, or 0 when it may try now. */
+function loginBlockSeconds(ip) {
+  const now = Date.now();
+  const list = LOGIN_ATTEMPTS.get(ip);
+  if (list === undefined) return 0;
+  pruneFailures(list, now);
+  if (list.length === 0) { LOGIN_ATTEMPTS.delete(ip); return 0; }
+  if (list.length < CFG.authMaxFailures) return 0;
+  return Math.max(1, Math.ceil((list[0] + CFG.authWindowMs - now) / 1000));
+}
+
 function recordFailure(ip) {
-  const rec = LOGIN_ATTEMPTS.get(ip) ?? { count: 0, until: 0 };
-  rec.count += 1;
-  if (rec.count >= 5) { rec.until = Date.now() + 60_000; rec.count = 0; }
-  LOGIN_ATTEMPTS.set(ip, rec);
+  const now = Date.now();
+  const list = LOGIN_ATTEMPTS.get(ip) ?? [];
+  pruneFailures(list, now);
+  list.push(now);
+  if (list.length > CFG.authMaxFailures) list.splice(0, list.length - CFG.authMaxFailures);
+  LOGIN_ATTEMPTS.set(ip, list);
+}
+
+// Drop expired IPs so a distributed spray cannot grow the map without bound.
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, list] of LOGIN_ATTEMPTS) {
+    pruneFailures(list, now);
+    if (list.length === 0) LOGIN_ATTEMPTS.delete(ip);
+  }
+  while (LOGIN_ATTEMPTS.size > AUTH_TRACKED_MAX) {
+    const oldest = LOGIN_ATTEMPTS.keys().next().value;
+    if (oldest === undefined) break;
+    LOGIN_ATTEMPTS.delete(oldest);
+  }
+}, 60_000).unref();
+
+// ------------------------------------------------------------- audit log ----
+// One stable line per outcome, e.g.
+//   2026-10-05T08:00:00.000Z [auth] login failed user=testuser ip=10.0.0.5
+// The client IP is always last so an `ip=<HOST>` filter (fail2ban-style) cannot
+// capture anything else. Falls back to stdout/journald when the file is
+// unavailable.
+let authLog = null; // WriteStream, or false once unavailable
+function audit(line) {
+  if (authLog === null) {
+    try {
+      fs.mkdirSync(path.dirname(AUTH_LOG_FILE), { recursive: true });
+      authLog = fs.createWriteStream(AUTH_LOG_FILE, { flags: 'a', mode: 0o600 });
+      authLog.on('error', (err) => console.error('[hub] audit log write failed:', err.message));
+    } catch (err) {
+      console.error('[hub] audit log unavailable, falling back to console:', err.message);
+      authLog = false;
+    }
+  }
+  const text = `${new Date().toISOString()} [auth] ${line}\n`;
+  if (authLog) authLog.write(text);
+  else process.stdout.write(text);
+}
+
+/** One log-safe token: no whitespace, control characters, equals, or quotes. */
+function logToken(value) {
+  return String(value ?? '').replace(/[^\x21-\x7e]/g, '_').replace(/[="\\]/g, '_').slice(0, 64);
 }
 
 // Two PAM paths:
@@ -698,8 +773,91 @@ const LOGIN_PAGE = `<!doctype html>
 
 // -------------------------------------------------------------- handlers ----
 
-function clientIp(req) {
-  return req.socket.remoteAddress ?? '?';
+// ------------------------------------------------------------ client IP -----
+// Rate-limited keys must be stable: strip zone ids / brackets / ports, unmap
+// IPv4-mapped IPv6, and canonicalize IPv6 so two spellings of one address share
+// a bucket.
+
+/** Canonicalize one address; unknown input is lowercased and returned as-is. */
+function normalizeIp(raw) {
+  if (typeof raw !== 'string') return '?';
+  let s = raw.trim();
+  if (s.startsWith('[')) {
+    const end = s.indexOf(']');
+    if (end !== -1) s = s.slice(1, end);
+  }
+  const zone = s.indexOf('%');
+  if (zone !== -1) s = s.slice(0, zone);
+  let mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(s);
+  if (mapped) s = mapped[1];
+  else {
+    mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(s);
+    if (mapped) {
+      const hi = parseInt(mapped[1], 16), lo = parseInt(mapped[2], 16);
+      s = `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
+    }
+  }
+  if (net.isIPv4(s)) return s;
+  if (net.isIPv6(s)) {
+    try { return new URL(`http://[${s}]/`).hostname.slice(1, -1); } catch { return s.toLowerCase(); }
+  }
+  const hostPort = /^(\d{1,3}(?:\.\d{1,3}){3}):\d+$/.exec(s);
+  return hostPort ? hostPort[1] : s.toLowerCase();
+}
+
+/** Expand a canonical address to its 4- or 16-byte form, or null. */
+function ipToBytes(ip) {
+  if (net.isIPv4(ip)) return ip.split('.').map((n) => Number(n) & 255);
+  if (!net.isIPv6(ip)) return null;
+  const parts = ip.split('::');
+  const left = parts[0] === '' ? [] : parts[0].split(':');
+  const right = parts.length > 1 && parts[1] !== '' ? parts[1].split(':') : [];
+  const groups = [...left, ...Array(Math.max(0, 8 - left.length - right.length)).fill('0'), ...right];
+  const bytes = [];
+  for (const g of groups) { const v = parseInt(g, 16); bytes.push((v >> 8) & 255, v & 255); }
+  return bytes.length === 16 ? bytes : null;
+}
+
+/** Whether `ip` falls inside an exact address or `addr/prefix` CIDR. */
+function ipInCidr(ip, cidr) {
+  const slash = cidr.indexOf('/');
+  const base = normalizeIp(slash === -1 ? cidr : cidr.slice(0, slash));
+  const bits = slash === -1 ? null : Number(cidr.slice(slash + 1));
+  const ipBytes = ipToBytes(ip);
+  const baseBytes = ipToBytes(base);
+  if (ipBytes === null || baseBytes === null || ipBytes.length !== baseBytes.length) return false;
+  if (bits === null) return ipBytes.every((b, i) => b === baseBytes[i]);
+  if (!Number.isInteger(bits) || bits < 0 || bits > ipBytes.length * 8) return false;
+  const whole = Math.floor(bits / 8);
+  for (let i = 0; i < whole; i++) if (ipBytes[i] !== baseBytes[i]) return false;
+  const rest = bits % 8;
+  if (rest === 0) return true;
+  const mask = (0xff << (8 - rest)) & 0xff;
+  return (ipBytes[whole] & mask) === (baseBytes[whole] & mask);
+}
+
+function isTrustedProxy(ip) {
+  return CFG.trustedProxies.some((entry) => ipInCidr(ip, entry));
+}
+
+/**
+ * Resolve the client address for rate limiting and audit lines. Without a
+ * configured trusted proxy the TCP peer is authoritative; with one, the
+ * rightmost untrusted hop in X-Forwarded-For wins (falling back to X-Real-IP),
+ * so a client-supplied header cannot move the limit to another address.
+ */
+function clientIp(req, peer = normalizeIp(req.socket.remoteAddress)) {
+  if (CFG.trustedProxies.length === 0 || !isTrustedProxy(peer)) return peer;
+  const header = req.headers['x-forwarded-for'];
+  const raw = Array.isArray(header) ? header.join(',') : String(header ?? '');
+  const chain = raw.split(',').map((part) => normalizeIp(part.split(';')[0])).filter((ip) => ip !== '' && ip !== '?');
+  for (let i = chain.length - 1; i >= 0; i--) {
+    if (!isTrustedProxy(chain[i])) return chain[i];
+  }
+  if (chain.length > 0) return chain[0];
+  const real = req.headers['x-real-ip'];
+  if (typeof real === 'string' && real.trim() !== '') return normalizeIp(real);
+  return peer;
 }
 
 function readBody(req, limit = 64 * 1024) {
@@ -721,24 +879,38 @@ function urlencoded(body) {
 }
 
 async function handleLogin(req, res) {
-  const ip = clientIp(req);
-  if (rateLimited(ip)) {
-    sendHtml(res, 429, LOGIN_PAGE.replace('__MSG__', '尝试过多,请 1 分钟后再试'));
+  const peer = normalizeIp(req.socket.remoteAddress);
+  const ip = clientIp(req, peer);
+  const via = ip === peer ? '' : ` proxy=${logToken(peer)}`;
+  const wait = loginBlockSeconds(ip);
+  if (wait > 0) {
+    audit(`login blocked ip=${logToken(ip)} retry_after=${wait}s`);
+    const text = wait < 60 ? `${wait} 秒` : `${Math.ceil(wait / 60)} 分钟`;
+    sendHtml(res, 429, LOGIN_PAGE.replace('__MSG__', `尝试过多,请 ${text}后再试`), { 'retry-after': String(wait) });
     return;
   }
   const { username, password } = urlencoded(await readBody(req));
   if (!username || !password) {
+    audit(`login rejected reason=missing-credentials ip=${logToken(ip)}${via}`);
     sendHtml(res, 401, LOGIN_PAGE.replace('__MSG__', '请输入用户名和密码'));
     return;
   }
   const info = lookupUser(username);
-  const ok = info && await pamAuthenticate(username, password)
-    && !(CFG.allowUsers.length && !CFG.allowUsers.includes(username));
+  let ok = false;
+  let reason = 'auth-failed';
+  if (!info) reason = 'unknown-user';
+  else if (!await pamAuthenticate(username, password)) reason = 'auth-failed';
+  else if (CFG.allowUsers.length && !CFG.allowUsers.includes(username)) reason = 'not-allowed';
+  else ok = true;
   if (!ok) {
     recordFailure(ip);
+    const blocked = loginBlockSeconds(ip);
+    audit(`login failed user=${logToken(username)} reason=${reason} ip=${logToken(ip)}${via}`
+      + (blocked > 0 ? ` blocked_for=${blocked}s` : ''));
     sendHtml(res, 401, LOGIN_PAGE.replace('__MSG__', '用户名或密码错误'));
     return;
   }
+  audit(`login ok user=${logToken(username)} ip=${logToken(ip)}${via}`);
   const token = makeCookie(username);
   res.writeHead(303, {
     'set-cookie': `${CFG.cookieName}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(CFG.sessionTtlMs / 1000)}`,
@@ -1296,6 +1468,11 @@ server.listen(CFG.hubPort, CFG.hubHost, () => {
   console.log(`[hub] running as ${IS_ROOT ? 'root (full isolation mode)' : `uid ${process.getuid?.()} (dev mode — no setuid/iptables)`}`);
   if (!IPTABLES) console.warn('[hub] WARNING: iptables unavailable — loopback ports of user instances are NOT guarded against other local users');
   if (CFG.allowUsers.length) console.log(`[hub] allow-list: ${CFG.allowUsers.join(', ')}`);
+  console.log(`[hub] login guard: ${CFG.authMaxFailures} failures / `
+    + (CFG.authWindowMs >= 60_000 ? `${Math.round(CFG.authWindowMs / 60_000)} min` : `${Math.round(CFG.authWindowMs / 1000)} s`)
+    + ' per IP'
+    + (CFG.trustedProxies.length ? `, trusting X-Forwarded-For from ${CFG.trustedProxies.join(', ')}` : ', using the TCP peer address only'));
+  console.log(`[hub] auth audit log: ${AUTH_LOG_FILE}`);
   console.log(CFG.cleanOnStop
     ? `[hub] on SIGTERM/SIGINT/SIGHUP: stop instances and remove ${CACHE_DIR} + ${SECRET_PATH}`
     : '[hub] on stop: instances stopped, cache and cookie secret kept (HUB_CLEAN_ON_STOP=0)');

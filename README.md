@@ -96,6 +96,10 @@ username/password**, and get a private dsh instance.
 | `COOKIE_SECRET_FILE` | `$CWD/.cookie-secret` | HMAC secret (auto-generated, `0600`) |
 | `HUB_CLEAN_ON_STOP` | `1` | on `SIGTERM`/`SIGINT`/`SIGHUP`, stop instances and delete `$CWD/cache` + the cookie secret; `0` keeps them |
 | `SHUTDOWN_GRACE_MS` | `5000` | how long a backend may take to exit before it is `SIGKILL`ed |
+| `AUTH_WINDOW_MS` | `600000` (10 min) | sliding window for failed logins per client IP |
+| `AUTH_MAX_FAILURES` | `5` | failures within the window before `/hub/login` answers `429` |
+| `TRUSTED_PROXIES` | *(none)* | comma-separated IPs/CIDRs whose `X-Forwarded-For` / `X-Real-IP` is trusted |
+| `HUB_AUTH_LOG` | `<HUB_LOG_DIR>/auth.log` | append-only authentication audit log (`0600`) |
 
 ## Architecture (the JupyterHub analogy)
 
@@ -171,12 +175,37 @@ re-minted on the 401. The token never reaches the browser, the URL bar stays
 clean, and dsh is not modified. If upstream ever stops printing the token line,
 the hub logs a warning and passes dsh's own 401 through unchanged.
 
+### Login guard and audit log
+
+`/hub/login` counts failed attempts per client IP in a **sliding window**
+(`AUTH_MAX_FAILURES` within `AUTH_WINDOW_MS`); reaching it answers `429` with
+`Retry-After` until the oldest counted failure ages out. Client addresses are
+canonicalized (zone ids, brackets, ports, IPv4-mapped IPv6, IPv6 spelling), and
+`X-Forwarded-For` / `X-Real-IP` are honored **only** when the TCP peer is listed
+in `TRUSTED_PROXIES`; otherwise the peer address is authoritative, and the
+rightmost untrusted hop wins — a client cannot move the limit onto another
+address.
+
+Every outcome is appended to `HUB_AUTH_LOG` (default `<HUB_LOG_DIR>/auth.log`,
+mode `0600`) as one line with the client IP last:
+
+```text
+2026-10-05T08:00:00.000Z [auth] login ok user=alice ip=10.0.0.5
+2026-10-05T08:00:03.000Z [auth] login failed user=bob reason=auth-failed ip=10.0.0.9
+2026-10-05T08:00:04.000Z [auth] login blocked ip=10.0.0.9 retry_after=587s
+```
+
+That lets an external log-driven banner (fail2ban/sshguard) filter `ip=<HOST>`
+and apply the actual ban; the hub keeps no ban list. If the file cannot be
+opened, lines fall back to stdout/journald.
+
 ## Isolation guarantees (run as root)
 
 - Each dsh instance runs as the user's own **uid/gid** with `DSH_HOME=~/.dsh`
 - Instances bind `127.0.0.1:<random port>`; an **iptables owner-guard**
   (loopback, `--uid-owner`) DROPs connections from other local users
-- Login rate-limiting (5 failures → 1 min lockout per IP)
+- Login guard: sliding window of failed attempts per client IP
+  (`AUTH_MAX_FAILURES` / `AUTH_WINDOW_MS`) plus a fail2ban-friendly audit log
 - Optional `ALLOW_USERS` allow-list
 
 ## Notes
