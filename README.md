@@ -105,11 +105,32 @@ username/password**, and get a private dsh instance.
 
 | JupyterHub | dsh-hub |
 |---|---|
-| Authenticator (PAM) | PAM via `authenticate-pam` (optional) with a `su`-based fallback; HMAC-signed session cookie |
+| Authenticator (PAM) | PAM via `node-linux-pam` (optional) with a `su`-based fallback; HMAC-signed session cookie |
 | Spawner | `dsh web --port <random>` spawned with the user's uid/gid and a per-user `DSH_HOME` |
 | Configurable HTTP proxy | `http-proxy` routes HTTP + WebSocket by session cookie |
 | Idle culler (jupyterhub-idle-culler) | built-in culler, `IDLE_CULL_MS` (0 = never, tmux-style always-on) |
 | Single-user server trusts the hub | loopback proxying with SameSite-cookie CSRF protection (JupyterHub's trust split) |
+
+### Source layout
+
+`src/index.mjs` is only the composition root (wiring and startup logs); the rest
+is split by responsibility:
+
+| File | Responsibility |
+|---|---|
+| `index.mjs` | composition root: build the server, register signal handling, listen |
+| `config.mjs` | environment → `CFG`, runtime paths (`SECRET_PATH`, `CACHE_DIR`, `AUTH_LOG_FILE`), trust mode, dsh binary detection |
+| `server.mjs` | HTTP server plus the WebSocket upgrade path routed by session cookie |
+| `router.mjs` | request gate, cold-start page, session-list interception, backend bridging and proxying |
+| `auth.mjs` | session cookies, client-IP resolution, sliding-window guard, audit log, PAM verification, login/logout |
+| `users.mjs` | cached `getent passwd` lookup |
+| `http.mjs` | shared response and request-body helpers |
+| `pages.mjs` + `pages/*.html` | dsh-hub's own login and cold-start pages, kept as real HTML files |
+| `backends.mjs` | per-user spawn/stop, iptables loopback guards, backend logs, idle culler |
+| `browser-session.mjs` | dsh launch-token capture and the `dsh-auth-*` cookie bridge |
+| `session-list-cache.mjs` | serve-stale `/api/session/list` cache |
+| `proxy.mjs` | `http-proxy` instance, HTML injections, dsh `401` bridge |
+| `shutdown.mjs` | signal teardown: kill instances, remove cache and cookie secret, exit |
 
 ### Trust model
 
