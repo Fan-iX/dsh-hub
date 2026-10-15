@@ -125,12 +125,23 @@ is split by responsibility:
 | `auth.mjs` | session cookies, client-IP resolution, sliding-window guard, audit log, PAM verification, login/logout |
 | `users.mjs` | cached `getent passwd` lookup |
 | `http.mjs` | shared response and request-body helpers |
-| `pages.mjs` + `pages/*.html` | dsh-hub's own login and cold-start pages, kept as real HTML files |
+| `i18n.mjs` | zh/en dictionaries and request locale resolution |
+| `pages.mjs` + `pages/*.html` + `pages/theme.css` | dsh-hub's own login and cold-start pages: real HTML templates, dsh-themed CSS, `{{key}}` i18n placeholders |
 | `backends.mjs` | per-user spawn/stop, iptables loopback guards, backend logs, idle culler |
 | `browser-session.mjs` | dsh launch-token capture and the `dsh-auth-*` cookie bridge |
 | `session-list-cache.mjs` | serve-stale `/api/session/list` cache |
 | `proxy.mjs` | `http-proxy` instance, HTML injections, dsh `401` bridge |
 | `shutdown.mjs` | signal teardown: kill instances, remove cache and cookie secret, exit |
+
+### Bilingual pages
+
+The hub's own pages (login and cold-start) render in Chinese or English, styled
+after dsh's web UI tokens. The locale is resolved per request: an explicit
+`?lang=zh|en`, then the `dshhub_lang` cookie it persists, then the browser's
+`Accept-Language`, then Chinese. The login page exposes the choice as a
+`中文 / English` switcher, and each response carries `Content-Language` plus
+`Vary: Accept-Language`. Rendering happens on the server, so the cold-start page
+stays a static, script-free document.
 
 ### Trust model
 
