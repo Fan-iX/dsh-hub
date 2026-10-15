@@ -36,6 +36,17 @@ export function createHubServer() {
       return;
     }
     be.lastActivity = Date.now();
+    // An attached event stream is live use: count it so the idle culler never
+    // reaps a backend whose browser is still watching (a long agent turn or a
+    // background job can run for hours without a single HTTP request). dsh
+    // heartbeats the stream every 2s and the client answers, so `data` keeps
+    // arriving; the count alone is the stronger guard.
+    be.wsClients += 1;
+    socket.on('data', () => { be.lastActivity = Date.now(); });
+    socket.on('close', () => {
+      be.wsClients = Math.max(0, be.wsClients - 1);
+      be.lastActivity = Date.now(); // the idle window starts when the stream detaches
+    });
     if (TRUST_MODE === 'origin-rewrite') {
       req.headers.origin = `http://127.0.0.1:${be.port}`;
     }

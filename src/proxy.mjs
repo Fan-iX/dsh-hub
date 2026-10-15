@@ -63,6 +63,9 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
   const url = String(req.url ?? '');
   const reqPath = new URL(url, 'http://x').pathname;
   const be = req.hubBackend;
+  // A response that keeps streaming (long poll / SSE) is live use too, so the
+  // idle culler counts its bytes as activity, not just the request that opened it.
+  if (be) proxyRes.on('data', () => { be.lastActivity = Date.now(); });
   // dsh refused the index with 401: the browser either has no dsh cookie yet or
   // holds a stale one. Re-mint it from the launch token and redirect, instead of
   // surfacing "reopen the URL printed by dsh web". The throttle stops a redirect

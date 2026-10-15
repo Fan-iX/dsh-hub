@@ -78,10 +78,11 @@ export async function route(req, res) {
     const entry = rpcCache.get(key);
     const now = Date.now();
     if (entry) {
+      const be = backends.get(user);
+      if (be) be.lastActivity = Date.now(); // a cache hit is browser activity too
       serveCachedSessionList(res, entry, requestRpcId(body));
       if (now >= entry.nextRevalidateAt && !entry.inflight) {
         entry.inflight = true;
-        const be = backends.get(user);
         if (be?.port) {
           revalidateSessionList(user, be, body, key).catch((err) =>
             console.error(`[hub] session.list revalidate failed for ${user}:`, err.message));

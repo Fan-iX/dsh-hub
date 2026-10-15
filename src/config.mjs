@@ -76,6 +76,9 @@ export const CFG = {
   // 0 disables culling entirely — backends keep running with the browser
   // closed, JupyterHub/tmux-style. Pick a positive value to reap idle ones.
   idleCullMs: intOrZero(process.env.IDLE_CULL_MS, 4 * 3600 * 1000),
+  // How often the idle culler looks. A backend with an attached event stream is
+  // never reaped, so this is only the checking cadence, not a second timeout.
+  cullIntervalMs: int(process.env.CULL_INTERVAL_MS, 60_000),
   spawnTimeoutMs: int(process.env.SPAWN_TIMEOUT_MS, 60_000),
   cookieName: 'dshhub_session',
   // Optional comma-separated allow-list of usernames. Empty = all system users.

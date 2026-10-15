@@ -29,6 +29,7 @@ class Backend {
     this.launchTokenWaiters = [];
     this.internalCookie = null;       // hub-minted dsh cookie for its own /api calls (prewarm/revalidate)
     this.bridgeAttemptAt = 0;         // throttles 401-triggered re-mints
+    this.wsClients = 0;               // attached event streams; a backend with one is never culled
   }
 }
 
@@ -190,7 +191,10 @@ export async function getOrCreateBackend(user) {
     if (backends.get(user) === be) backends.delete(user);
   });
 
-  be.ready = waitTcp(port, CFG.spawnTimeoutMs).finally(() => { be.starting = false; });
+  be.ready = waitTcp(port, CFG.spawnTimeoutMs).finally(() => {
+    be.starting = false;
+    be.lastActivity = Date.now(); // the idle window starts at readiness, not at fork
+  });
   await be.ready;
   prewarmSessionList(user, be); // warm the session-list cache before the browser asks
   return be;
@@ -206,11 +210,21 @@ async function stopBackend(user) {
 
 // Idle culler. 0 = never cull (JupyterHub-style always-on backends; the
 // browser-closed conversation keeps running indefinitely, tmux-style).
+//
+// Idleness is measured from `lastActivity`, which every proxied HTTP request and
+// every frame of a proxied event stream refreshes. A backend that still has an
+// attached stream is never reaped even if no frame arrived inside the window:
+// dsh heartbeats the stream every 2s, so an attached browser would otherwise
+// keep it active anyway — the guard just makes a stalled reader explicit. This
+// is what keeps a long server-side turn (say, an agent blocked on a background
+// job) alive while the user watches it.
 if (CFG.idleCullMs > 0) {
   setInterval(() => {
     const now = Date.now();
     for (const [user, be] of backends) {
+      if (be.starting) continue;        // a spawn in flight is work, not idleness
+      if (be.wsClients > 0) continue;   // a live event stream keeps the instance
       if (now - be.lastActivity > CFG.idleCullMs) stopBackend(user);
     }
-  }, 60_000).unref();
+  }, CFG.cullIntervalMs).unref();
 }
