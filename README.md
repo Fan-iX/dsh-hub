@@ -90,6 +90,7 @@ username/password**, and get a private dsh instance.
 | `TRUST_MODE` | `origin-rewrite` | `trusted-host` forwards Host/Origin untouched (see trust model above) |
 | `TRUSTED_HOSTS` | auto (LAN IPv4s) | extra authorities for `--trusted-host` (hostnames/DNS names) |
 | `IDLE_CULL_MS` | `14400000` (4h) | `0` disables culling — backends keep running with the browser closed |
+| `CULL_INTERVAL_MS` | `60000` (1 min) | how often the culler checks; an attached event stream is never reaped |
 | `SESSION_TTL_MS` | 7 days | cookie lifetime |
 | `ALLOW_USERS` | *(all)* | comma-separated username allow-list |
 | `HUB_LOG_DIR` | `/var/log/dsh-hub` | per-user backend logs |
@@ -142,6 +143,21 @@ after dsh's web UI tokens. The locale is resolved per request: an explicit
 `中文 / English` switcher, and each response carries `Content-Language` plus
 `Vary: Accept-Language`. Rendering happens on the server, so the cold-start page
 stays a static, script-free document.
+
+### Idle culling vs. long-running work
+
+The culler reaps a backend only after `IDLE_CULL_MS` without activity, and
+activity means real traffic to that instance: every proxied HTTP request, every
+byte of a streaming response, and every frame of the WebSocket event stream
+refresh it. A backend with an **attached event stream is never reaped**, so a
+long agent turn — including one blocked on a background job — cannot be
+terminated while a browser is watching it. A spawn in flight is never reaped
+either, and the idle clock restarts when the last stream detaches.
+
+What the hub cannot see is work that outlives the browser (a goal or background
+job still running after the client disconnects): dsh exposes no cheap "still
+busy" query, so such an instance is still reaped after `IDLE_CULL_MS`. Set
+`IDLE_CULL_MS=0` to keep every instance alive until it is stopped.
 
 ### Trust model
 
