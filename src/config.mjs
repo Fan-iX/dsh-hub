@@ -79,6 +79,11 @@ export const CFG = {
   // How often the idle culler looks. A backend with an attached event stream is
   // never reaped, so this is only the checking cadence, not a second timeout.
   cullIntervalMs: int(process.env.CULL_INTERVAL_MS, 60_000),
+  // Hide the DeepSeek account sign-in UI in instances this hub spawns: the PKCE
+  // flow accepts a loopback browser origin only, which a LAN-served hub is not.
+  // Set HIDE_ACCOUNT_UI=0 when every browser reaches the hub over loopback and
+  // the account section is wanted.
+  hideAccountUi: process.env.HIDE_ACCOUNT_UI !== '0',
   spawnTimeoutMs: int(process.env.SPAWN_TIMEOUT_MS, 60_000),
   cookieName: 'dshhub_session',
   // Optional comma-separated allow-list of usernames. Empty = all system users.

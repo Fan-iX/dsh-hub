@@ -27,9 +27,11 @@ import {
 import { loadPersistedCache } from './session-list-cache.mjs';
 import { createHubServer } from './server.mjs';
 import { createShutdown, registerSignalHandlers } from './shutdown.mjs';
+import { writeAccountUiPatch } from './dsh-patch.mjs';
 
 // -------------------------------------------------------------------- wire ---
 loadPersistedCache(); // restore session-list cache entries across hub restarts
+const accountUiHidden = CFG.hideAccountUi && writeAccountUiPatch();
 const server = createHubServer();
 registerSignalHandlers(createShutdown(server));
 
@@ -54,4 +56,9 @@ server.listen(CFG.hubPort, CFG.hubHost, () => {
   console.log(CFG.idleCullMs === 0
     ? '[hub] idle culling DISABLED — backends run until stopped'
     : `[hub] idle cull after ${Math.round(CFG.idleCullMs / 60000)} min`);
+  console.log(accountUiHidden
+    ? '[hub] account UI: hidden in spawned dsh instances (HIDE_ACCOUNT_UI=0 shows it)'
+    : CFG.hideAccountUi
+      ? '[hub] WARNING: account-UI patch missing — spawned instances keep the sign-in button'
+      : '[hub] account UI: visible in spawned dsh instances (HIDE_ACCOUNT_UI=0)');
 });

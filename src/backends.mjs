@@ -7,6 +7,7 @@ import { execFileSync, spawn } from 'node:child_process';
 
 import { CFG, IPTABLES, IS_ROOT, TRUSTED_HOSTS, TRUST_MODE } from './config.mjs';
 import { setLaunchToken } from './browser-session.mjs';
+import { ACCOUNT_UI_PATCH_PATH } from './dsh-patch.mjs';
 import { prewarmSessionList } from './session-list-cache.mjs';
 import { lookupUser } from './users.mjs';
 
@@ -155,7 +156,14 @@ export async function getOrCreateBackend(user) {
   else console.warn('[hub] non-root: spawning dsh as hub user (dev mode, no isolation)');
 
   console.log(`[hub] spawning dsh for ${user} (uid ${info.uid}) on 127.0.0.1:${port}, DSH_HOME=${env.DSH_HOME}`);
-  const args = [CFG.dshBin, 'web', '--port', String(port), "--no-open"];
+  // `--profile web` (rather than the `web` abbreviation) is required once the
+  // launcher-level `--patch` overlay is in play. The overlay hides the
+  // loopback-only account UI; the user's own cordis.patch.yml is never touched.
+  const args = [CFG.dshBin, '--profile', 'web'];
+  if (CFG.hideAccountUi && fs.existsSync(ACCOUNT_UI_PATCH_PATH)) {
+    args.push('--patch', ACCOUNT_UI_PATCH_PATH);
+  }
+  args.push('--port', String(port), '--no-open');
   if (TRUST_MODE === 'trusted-host') {
     for (const authority of TRUSTED_HOSTS) args.push('--trusted-host', authority);
   }
