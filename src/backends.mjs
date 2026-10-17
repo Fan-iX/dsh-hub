@@ -128,6 +128,9 @@ export async function getOrCreateBackend(user) {
   const env = {
     HOME: home,
     DSH_HOME: path.join(home, '.dsh'),   // per-user data root: sessions, keys, settings
+    // Marks the process as hub-spawned for host-side plugins (dsh-hub-utils
+    // registers its quit route only under the hub).
+    DSH_HUB: '1',
     PATH: '/usr/local/bin:/usr/bin:/bin',
     LANG: process.env.LANG ?? 'en_US.UTF-8',
     TERM: 'xterm-256color',

@@ -48,6 +48,12 @@ catch(e){try{crypto.randomUUID=uuid4;}catch(e2){}}
 const DSH_TRANSPORT_HOOK =
   `<script>window.__DSH_TRANSPORT__=Object.assign({},window.__DSH_TRANSPORT__,{ownsHost:true});</script>`;
 
+// Marks a page as hub-served. The hub is the only entry to the backend, so a
+// browser plugin that only makes sense under the hub (dsh-hub-utils) checks this
+// marker and stays out of a bare `dsh web`. The version keeps a later marker
+// change detectable.
+const DSH_HUB_HOOK = '<script>window.__DSH_HUB__={version:1};</script>';
+
 export const proxy = httpProxy.createProxyServer({
   ws: true,
   // trusted-host mode keeps the browser's real Host so dsh's own fence (fed by
@@ -100,7 +106,7 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
     delete headers['content-encoding'];
     res.writeHead(proxyRes.statusCode, headers);
     const html = Buffer.concat(chunks).toString('utf-8');
-    const injection = DSH_TRANSPORT_HOOK + RANDOM_UUID_POLYFILL;
+    const injection = DSH_HUB_HOOK + DSH_TRANSPORT_HOOK + RANDOM_UUID_POLYFILL;
     const injected = /<head[^>]*>/i.test(html)
       ? html.replace(/<head[^>]*>/i, (m) => m + injection)
       : injection + html;

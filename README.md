@@ -199,6 +199,12 @@ instance, and the flag resets when the instance is replaced (restart, crash,
 hub restart). Nothing else in the hub changes — no dsh patch, no new process, no
 persisted state.
 
+The plugin is hub-only, and the hub marks its own pages so it can tell: the
+proxied index carries `window.__DSH_HUB__={version:1}` (injected next to the
+transport hook), and a spawned backend gets `DSH_HUB=1` in its environment. The
+plugin registers its sidebar action and quit route only when those markers are
+present, so a bare `dsh web` shows no button and exposes no extra route.
+
 ### Trust model
 
 dsh's web server enforces a browser trust fence (`Origin`/`Host` authority
