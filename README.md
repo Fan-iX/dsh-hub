@@ -162,11 +162,12 @@ busy" query, so such an instance is still reaped after `IDLE_CULL_MS`. Set
 
 ### Keep-alive from the web UI
 
-The `dsh-hub-utils` plugin adds a
-**Settings → dsh-hub** switch that pins the current instance, covering exactly
-the browser-closed case above. It talks to two small hub routes, authenticated by
-the normal hub session cookie and accepting only `application/json` (the
-`SameSite=Lax` cookie plus the JSON content type is the CSRF guard):
+The `dsh-hub-utils` plugin adds a **dsh-hub** button at the sidebar foot whose
+panel carries the keep-alive switch (alongside a quit action), covering exactly
+the browser-closed case above. The switch talks to two small hub routes,
+authenticated by the normal hub session cookie and accepting only
+`application/json` (the `SameSite=Lax` cookie plus the JSON content type is the
+CSRF guard):
 
 | Route | Body | Response |
 |---|---|---|
