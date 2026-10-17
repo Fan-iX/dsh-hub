@@ -9,6 +9,7 @@ import { localeFromRequest, languageCookie, t } from './i18n.mjs';
 import { loginPage, startingPage } from './pages.mjs';
 import { lookupUser } from './users.mjs';
 import { handleLogin, handleLogout, sessionUser } from './auth.mjs';
+import { handleKeepAlive } from './keepalive.mjs';
 import {
   SESSION_LIST_PATH, deferSessionList, forwardSessionList, isCacheableSessionList,
   requestRpcId, revalidateSessionList, rpcCache, serveCachedSessionList,
@@ -67,6 +68,10 @@ export async function route(req, res) {
   }
   if (!lookupUser(user)) {  // account deleted since login
     handleLogout(req, res);
+    return;
+  }
+  if (url.pathname === '/hub/api/keepalive') {
+    await handleKeepAlive(req, res, user);
     return;
   }
 

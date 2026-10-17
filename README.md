@@ -129,6 +129,7 @@ is split by responsibility:
 | `i18n.mjs` | zh/en dictionaries and request locale resolution |
 | `pages.mjs` + `pages/*.html` + `pages/theme.css` | dsh-hub's own login and cold-start pages: real HTML templates, dsh-themed CSS, `{{key}}` i18n placeholders |
 | `backends.mjs` | per-user spawn/stop, iptables loopback guards, backend logs, idle culler |
+| `keepalive.mjs` | `GET`/`POST /hub/api/keepalive`: opt the current instance out of idle culling from the web UI |
 | `browser-session.mjs` | dsh launch-token capture and the `dsh-auth-*` cookie bridge |
 | `session-list-cache.mjs` | serve-stale `/api/session/list` cache |
 | `proxy.mjs` | `http-proxy` instance, HTML injections, dsh `401` bridge |
@@ -158,6 +159,24 @@ What the hub cannot see is work that outlives the browser (a goal or background
 job still running after the client disconnects): dsh exposes no cheap "still
 busy" query, so such an instance is still reaped after `IDLE_CULL_MS`. Set
 `IDLE_CULL_MS=0` to keep every instance alive until it is stopped.
+
+### Keep-alive from the web UI
+
+The `dsh-hub-utils` plugin adds a
+**Settings → dsh-hub** switch that pins the current instance, covering exactly
+the browser-closed case above. It talks to two small hub routes, authenticated by
+the normal hub session cookie and accepting only `application/json` (the
+`SameSite=Lax` cookie plus the JSON content type is the CSRF guard):
+
+| Route | Body | Response |
+|---|---|---|
+| `GET /hub/api/keepalive` | — | `{"keepAlive":boolean,"running":boolean}` |
+| `POST /hub/api/keepalive` | `{"keepAlive":boolean}` | the same JSON |
+
+The flag lives on the per-user backend object: the culler skips a pinned
+instance, and the flag resets when the instance is replaced (restart, crash,
+hub restart). Nothing else in the hub changes — no dsh patch, no new process, no
+persisted state.
 
 ### Trust model
 

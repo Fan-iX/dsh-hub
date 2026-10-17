@@ -30,6 +30,7 @@ class Backend {
     this.internalCookie = null;       // hub-minted dsh cookie for its own /api calls (prewarm/revalidate)
     this.bridgeAttemptAt = 0;         // throttles 401-triggered re-mints
     this.wsClients = 0;               // attached event streams; a backend with one is never culled
+    this.keepAlive = false;           // user opted out of idle culling (dsh-hub-utils toggle)
   }
 }
 
@@ -224,6 +225,7 @@ if (CFG.idleCullMs > 0) {
     for (const [user, be] of backends) {
       if (be.starting) continue;        // a spawn in flight is work, not idleness
       if (be.wsClients > 0) continue;   // a live event stream keeps the instance
+      if (be.keepAlive) continue;       // the user pinned this instance from the web UI
       if (now - be.lastActivity > CFG.idleCullMs) stopBackend(user);
     }
   }, CFG.cullIntervalMs).unref();
