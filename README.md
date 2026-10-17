@@ -91,6 +91,7 @@ username/password**, and get a private dsh instance.
 | `TRUSTED_HOSTS` | auto (LAN IPv4s) | extra authorities for `--trusted-host` (hostnames/DNS names) |
 | `IDLE_CULL_MS` | `14400000` (4h) | `0` disables culling — backends keep running with the browser closed |
 | `CULL_INTERVAL_MS` | `60000` (1 min) | how often the culler checks; an attached event stream is never reaped |
+| `HIDE_ACCOUNT_UI` | `1` | hide the DeepSeek account sign-in UI in hub-spawned instances (its PKCE callback must be loopback); `0` shows it |
 | `SESSION_TTL_MS` | 7 days | cookie lifetime |
 | `ALLOW_USERS` | *(all)* | comma-separated username allow-list |
 | `HUB_LOG_DIR` | `/var/log/dsh-hub` | per-user backend logs |
@@ -129,6 +130,7 @@ is split by responsibility:
 | `i18n.mjs` | zh/en dictionaries and request locale resolution |
 | `pages.mjs` + `pages/*.html` + `pages/theme.css` | dsh-hub's own login and cold-start pages: real HTML templates, dsh-themed CSS, `{{key}}` i18n placeholders |
 | `backends.mjs` | per-user spawn/stop, iptables loopback guards, backend logs, idle culler |
+| `dsh-patch.mjs` | the `--patch` overlay that hides the DeepSeek account UI in spawned instances |
 | `keepalive.mjs` | `GET`/`POST /hub/api/keepalive`: opt the current instance out of idle culling from the web UI |
 | `browser-session.mjs` | dsh launch-token capture and the `dsh-auth-*` cookie bridge |
 | `session-list-cache.mjs` | serve-stale `/api/session/list` cache |
@@ -144,6 +146,24 @@ after dsh's web UI tokens. The locale is resolved per request: an explicit
 `中文 / English` switcher, and each response carries `Content-Language` plus
 `Vary: Accept-Language`. Rendering happens on the server, so the cold-start page
 stays a static, script-free document.
+
+### DeepSeek account sign-in
+
+dsh 0.2.1+ ships a DeepSeek account sign-in button (OAuth authorization code +
+PKCE S256). Its flow validates the browser callback origin with `loginOrigin()`,
+which accepts **only loopback HTTP** (`http://localhost|127.0.0.1|[::1]:<port>`) —
+a deliberate RFC 8252 guard. A hub served on a LAN hostname can never satisfy
+it, so the button cannot work there; only a loopback hub URL (local or
+`ssh -L 3080:127.0.0.1:3080`) or a manually launched `dsh` can sign in.
+
+Hub-spawned instances therefore hide the account UI by default: the hub writes a
+`--patch` overlay (`<HUB_CWD>/hub-no-account-ui.patch.yml`) that disables the
+`ui-settings-account` plugin, and passes it to the dsh it spawns. The user's own
+`$DSH_HOME/cordis.patch.yml` is untouched, so a manually launched dsh keeps the
+button; because both share `DSH_HOME=~/.dsh`, a grant obtained there is reused by
+the hub instance (and the `deepseek-account` model provider keeps working).
+Set `HIDE_ACCOUNT_UI=0` to show the button again — sensible only when every
+browser reaches the hub over loopback.
 
 ### Idle culling vs. long-running work
 
