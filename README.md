@@ -91,7 +91,8 @@ username/password**, and get a private dsh instance.
 | `TRUSTED_HOSTS` | auto (LAN IPv4s) | extra authorities for `--trusted-host` (hostnames/DNS names) |
 | `IDLE_CULL_MS` | `14400000` (4h) | `0` disables culling — backends keep running with the browser closed |
 | `CULL_INTERVAL_MS` | `60000` (1 min) | how often the culler checks; an attached event stream is never reaped |
-| `HIDE_ACCOUNT_UI` | `1` | hide the DeepSeek account sign-in UI in hub-spawned instances (its PKCE callback must be loopback); `0` shows it |
+| `HIDE_ACCOUNT_UI` | `1` | hide the DeepSeek account sign-in UI via the built-in overlay (its PKCE callback must be loopback); `0` omits the overlay |
+| `HUB_WEB_CONFIG_DIR` | `/etc/dsh-hub/web_config.d` | `*.yml` drop-ins applied as `--patch` to spawned instances, in file-name order (non-secret, world-readable) |
 | `SESSION_TTL_MS` | 7 days | cookie lifetime |
 | `ALLOW_USERS` | *(all)* | comma-separated username allow-list |
 | `HUB_LOG_DIR` | `/var/log/dsh-hub` | per-user backend logs |
@@ -130,7 +131,7 @@ is split by responsibility:
 | `i18n.mjs` | zh/en dictionaries and request locale resolution |
 | `pages.mjs` + `pages/*.html` + `pages/theme.css` | dsh-hub's own login and cold-start pages: real HTML templates, dsh-themed CSS, `{{key}}` i18n placeholders |
 | `backends.mjs` | per-user spawn/stop, iptables loopback guards, backend logs, idle culler |
-| `dsh-patch.mjs` | the `--patch` overlay that hides the DeepSeek account UI in spawned instances |
+| `web-config.mjs` | builds the `--patch` list for spawned instances: the built-in account-UI default plus admin `web_config.d` drop-ins |
 | `keepalive.mjs` | `GET`/`POST /hub/api/keepalive`: opt the current instance out of idle culling from the web UI |
 | `browser-session.mjs` | dsh launch-token capture and the `dsh-auth-*` cookie bridge |
 | `session-list-cache.mjs` | serve-stale `/api/session/list` cache |
@@ -156,14 +157,52 @@ a deliberate RFC 8252 guard. A hub served on a LAN hostname can never satisfy
 it, so the button cannot work there; only a loopback hub URL (local or
 `ssh -L 3080:127.0.0.1:3080`) or a manually launched `dsh` can sign in.
 
-Hub-spawned instances therefore hide the account UI by default: the hub writes a
-`--patch` overlay (`<HUB_CWD>/hub-no-account-ui.patch.yml`) that disables the
-`ui-settings-account` plugin, and passes it to the dsh it spawns. The user's own
-`$DSH_HOME/cordis.patch.yml` is untouched, so a manually launched dsh keeps the
-button; because both share `DSH_HOME=~/.dsh`, a grant obtained there is reused by
-the hub instance (and the `deepseek-account` model provider keeps working).
-Set `HIDE_ACCOUNT_UI=0` to show the button again — sensible only when every
-browser reaches the hub over loopback.
+Hub-spawned instances therefore hide the account UI by default: the hub writes
+a built-in `--patch` overlay (in `/run/dsh-hub/`, world-readable) that disables
+the `ui-settings-account` plugin, and passes it before any admin drop-ins. The
+user's own `$DSH_HOME/cordis.patch.yml` is untouched, so a manually launched dsh
+keeps the button; because both share `DSH_HOME=~/.dsh`, a grant obtained there is
+reused by the hub instance (and the `deepseek-account` model provider keeps
+working). A later `web_config.d` drop-in can restore the account UI with
+`disabled: false`, and `HIDE_ACCOUNT_UI=0` omits the built-in overlay entirely.
+
+### Global dsh overlays (`web_config.d`)
+
+Administrators can layer dsh configuration onto every instance the hub spawns
+without touching dsh or the hub: drop `*.yml` (or `*.yaml`) files into
+`/etc/dsh-hub/web_config.d` (`HUB_WEB_CONFIG_DIR` overrides the path). Files are
+passed to each spawned dsh as `--patch` overlays in **file-name order**, after
+the hub's built-in account-UI overlay, so prefixes (`10-`, `20-`) control
+precedence and a later file can override an earlier row (`disabled: false`
+re-enables one). The directory is re-read on every spawn, so adding a file needs
+no hub restart; the startup log lists what was applied.
+
+Two rules make this safe:
+
+- **No secrets.** The files are world-readable and are read by every user's dsh
+  process. Per-user secrets belong in that user's `~/.dsh/cordis.patch.yml`
+  (`0600`).
+- **World-readable files.** The spawned dsh runs as the target user, not root.
+  Keep the directory `0755` and files `0644`; the hub skips a file it finds not
+  world-readable and logs a warning instead of breaking every spawn.
+
+A malformed drop-in does break every spawn, so validate one before installing it:
+
+```bash
+dsh --profile web --patch /etc/dsh-hub/web_config.d/20-mine.patch.yml --dump-config
+```
+
+For example, to keep the DeepSeek account UI (only meaningful on a loopback-only
+hub), add a later overlay that wins over the built-in one:
+
+```yaml
+# /etc/dsh-hub/web_config.d/50-show-account-ui.patch.yml
+- id: ui-settings-account
+  disabled: false
+```
+
+The previous `<HUB_CWD>/hub-no-account-ui.patch.yml` is no longer read; delete it
+after upgrading.
 
 ### Idle culling vs. long-running work
 
