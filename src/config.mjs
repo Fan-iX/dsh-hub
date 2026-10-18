@@ -84,6 +84,9 @@ export const CFG = {
   // Set HIDE_ACCOUNT_UI=0 when every browser reaches the hub over loopback and
   // the account section is wanted.
   hideAccountUi: process.env.HIDE_ACCOUNT_UI !== '0',
+  // Admin-maintained global dsh overlays (`*.yml` drop-ins) applied to every
+  // instance the hub spawns, in file-name order. Non-secret, world-readable.
+  webConfigDir: process.env.HUB_WEB_CONFIG_DIR ?? '/etc/dsh-hub/web_config.d',
   spawnTimeoutMs: int(process.env.SPAWN_TIMEOUT_MS, 60_000),
   cookieName: 'dshhub_session',
   // Optional comma-separated allow-list of usernames. Empty = all system users.

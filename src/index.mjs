@@ -27,11 +27,13 @@ import {
 import { loadPersistedCache } from './session-list-cache.mjs';
 import { createHubServer } from './server.mjs';
 import { createShutdown, registerSignalHandlers } from './shutdown.mjs';
-import { writeAccountUiPatch } from './dsh-patch.mjs';
+import { webConfigPatches, writeBuiltinPatch } from './web-config.mjs';
 
 // -------------------------------------------------------------------- wire ---
 loadPersistedCache(); // restore session-list cache entries across hub restarts
-const accountUiHidden = CFG.hideAccountUi && writeAccountUiPatch();
+const builtinPatch = writeBuiltinPatch();
+const builtinPatches = webConfigPatches();
+const adminPatches = builtinPatches.filter((patch) => patch !== builtinPatch);
 const server = createHubServer();
 registerSignalHandlers(createShutdown(server));
 
@@ -56,9 +58,11 @@ server.listen(CFG.hubPort, CFG.hubHost, () => {
   console.log(CFG.idleCullMs === 0
     ? '[hub] idle culling DISABLED — backends run until stopped'
     : `[hub] idle cull after ${Math.round(CFG.idleCullMs / 60000)} min`);
-  console.log(accountUiHidden
+  console.log(`[hub] web config: ${CFG.webConfigDir} (${adminPatches.length} drop-in(s))`);
+  for (const patch of adminPatches) console.log(`[hub] web config: applied ${patch}`);
+  console.log(builtinPatch
     ? '[hub] account UI: hidden in spawned dsh instances (HIDE_ACCOUNT_UI=0 shows it)'
     : CFG.hideAccountUi
-      ? '[hub] WARNING: account-UI patch missing — spawned instances keep the sign-in button'
+      ? '[hub] WARNING: account-UI overlay missing — spawned instances keep the sign-in button'
       : '[hub] account UI: visible in spawned dsh instances (HIDE_ACCOUNT_UI=0)');
 });
