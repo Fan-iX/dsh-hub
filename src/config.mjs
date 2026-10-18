@@ -79,11 +79,6 @@ export const CFG = {
   // How often the idle culler looks. A backend with an attached event stream is
   // never reaped, so this is only the checking cadence, not a second timeout.
   cullIntervalMs: int(process.env.CULL_INTERVAL_MS, 60_000),
-  // Hide the DeepSeek account sign-in UI in instances this hub spawns: the PKCE
-  // flow accepts a loopback browser origin only, which a LAN-served hub is not.
-  // Set HIDE_ACCOUNT_UI=0 when every browser reaches the hub over loopback and
-  // the account section is wanted.
-  hideAccountUi: process.env.HIDE_ACCOUNT_UI !== '0',
   // Admin-maintained global dsh overlays (`*.yml` drop-ins) applied to every
   // instance the hub spawns, in file-name order. Non-secret, world-readable.
   webConfigDir: process.env.HUB_WEB_CONFIG_DIR ?? '/etc/dsh-hub/web_config.d',

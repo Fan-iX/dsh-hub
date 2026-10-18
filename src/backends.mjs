@@ -160,8 +160,9 @@ export async function getOrCreateBackend(user) {
 
   console.log(`[hub] spawning dsh for ${user} (uid ${info.uid}) on 127.0.0.1:${port}, DSH_HOME=${env.DSH_HOME}`);
   // `--profile web` (rather than the `web` abbreviation) is required once the
-  // launcher-level `--patch` overlays are in play. The built-in overlay hides
-  // the loopback-only account UI; the admin drop-ins follow in file-name order.
+  // launcher-level `--patch` overlays are in play. Admin drop-ins apply in
+  // file-name order; dsh applies `--patch` after `$DSH_HOME/cordis.patch.yml`,
+  // so they are authoritative over a user's own patch for the rows they touch.
   const args = [CFG.dshBin, '--profile', 'web'];
   for (const patch of webConfigPatches()) args.push('--patch', patch);
   args.push('--port', String(port), '--no-open');
