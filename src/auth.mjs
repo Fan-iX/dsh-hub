@@ -5,107 +5,128 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 
-import { AUTH_LOG_FILE, CFG, IS_ROOT, RUNTIME_DIR, SECRET_PATH } from './config.mjs';
+import { AUTH_LOG_FILE, CFG, IS_ROOT } from './config.mjs';
 import { readBody, sendHtml, urlencoded } from './http.mjs';
 import { localeFromRequest, t } from './i18n.mjs';
 import { loginPage } from './pages.mjs';
 import { lookupUser } from './users.mjs';
 
-// ----------------------------------------------------------- cookie secret --
+// --------------------------------------------------- session credential -----
 
-const SECRET_BYTES = 32;
+// A cookie is `user.exp.HMAC(key(user), user.exp)`, where `key(user)` comes from
+// that user's shadow entry. A password change, lock, or forced change alters the
+// entry and invalidates the user's cookies. The pepper lives only in this
+// process: a shadow backup alone cannot forge a cookie, and no secret file is
+// written. A restart therefore invalidates all sessions, matching the default
+// clean-stop behavior.
 
-/** The secret must stay owner-only: any local reader can forge every session. */
-function secureSecretFile() {
+const PEPPER = crypto.randomBytes(32);
+const USERS_MAX = 10_000;
+const USERS = new Map(); // user -> { key, hasPassword, checkedAt, mtime, lastUsed }
+
+/** A shadow password field that can actually authenticate (not empty/locked). */
+function hasUsablePassword(hash) {
+  return hash !== ''
+    && hash !== 'x'
+    && hash !== '*'
+    && hash !== '!'
+    && !hash.startsWith('!')
+    && !hash.startsWith('*');
+}
+
+/**
+ * Read one user's shadow entry through NSS (`getent`). The whole line is the
+ * fingerprint: the hash changes with the password, and the other fields change
+ * on lock, expiry, or a forced change. No shadow file is parsed directly.
+ * @param user - account name.
+ * @returns `{ line, hasPassword }`, or null when no shadow entry is available.
+ */
+function readShadow(user) {
+  if (!/^[a-z_][a-z0-9_-]{0,31}$/i.test(user)) return null;
+  let out;
   try {
-    fs.chmodSync(SECRET_PATH, 0o600);
-  } catch (err) {
-    console.warn(`[hub] cannot tighten ${SECRET_PATH} permissions:`, err.message);
+    out = execFileSync('getent', ['shadow', user], {
+      timeout: 3000,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+  } catch {
+    return null;
+  }
+  const line = out.split('\n').find((row) => row.startsWith(`${user}:`));
+  if (line === undefined) return null;
+  const fields = line.split(':');
+  if (fields.length < 2 || fields[0] !== user) return null;
+  return { line, hasPassword: hasUsablePassword(fields[1]) };
+}
+
+/** mtime of the local shadow file, or 0 when NSS provides no such file. */
+function shadowMtime() {
+  try {
+    return fs.statSync('/etc/shadow').mtimeMs;
+  } catch {
+    return 0;
   }
 }
 
 /**
- * Load the HMAC secret, or create one. A truncated or empty file is never used:
- * its HMAC is computable by anyone, which would let a cookie be forged without
- * a password. A too-short file is replaced.
+ * The cached per-user key. The cache stores only the derived key (never the
+ * shadow line) and is bounded. A cookie for a user with no cache entry is
+ * rejected without an NSS call, so forged cookies cannot force `getent` runs.
+ * @param user - account name.
+ * @param force - refresh even when fresh (used at login).
+ * @returns the entry, or null when the user has no shadow entry.
  */
-function loadOrCreateSecret() {
-  let stat = null;
-  try {
-    stat = fs.lstatSync(SECRET_PATH);
-  } catch (err) {
-    if (err.code !== 'ENOENT') throw err;
-  }
-  // A symlink (or any non-file) could make the hub read/chmod/overwrite a file
-  // chosen by a local user; refuse rather than follow it.
-  if (stat !== null && !stat.isFile()) {
-    console.error(`[hub] FATAL: ${SECRET_PATH} is not a regular file; refusing to use it`);
-    process.exit(1);
-  }
-  let existing = null;
-  if (stat !== null) {
-    existing = fs.readFileSync(SECRET_PATH);
-    const uid = process.getuid?.();
-    if (uid !== undefined && stat.uid !== uid) {
-      console.warn(`[hub] ${SECRET_PATH} is owned by uid ${stat.uid}, not the hub user`);
+function credentialFor(user, force = false) {
+  const now = Date.now();
+  const cached = USERS.get(user);
+  if (!force && cached !== undefined) {
+    const fresh = now - cached.checkedAt < CFG.fingerprintTtlMs && shadowMtime() <= cached.mtime;
+    if (fresh) {
+      cached.lastUsed = now;
+      USERS.delete(user);
+      USERS.set(user, cached);
+      return cached;
     }
   }
-  if (existing !== null && existing.length >= SECRET_BYTES) {
-    secureSecretFile();
-    return existing;
+  const shadow = readShadow(user);
+  if (shadow === null) {
+    USERS.delete(user);
+    return null;
   }
-  if (existing !== null) {
-    console.warn(`[hub] ${SECRET_PATH} is too short (${existing.length} bytes); regenerating it`);
+  const key = crypto.createHmac('sha256', PEPPER).update(`${user}\0${shadow.line}`).digest();
+  const entry = {
+    key,
+    hasPassword: shadow.hasPassword,
+    checkedAt: now,
+    mtime: shadowMtime(),
+    lastUsed: now,
+  };
+  USERS.delete(user);
+  USERS.set(user, entry);
+  if (USERS.size > USERS_MAX) {
+    const oldest = USERS.keys().next().value;
+    if (oldest !== undefined) USERS.delete(oldest);
   }
-  const secret = crypto.randomBytes(SECRET_BYTES);
-  try {
-    if (existing === null) {
-      fs.writeFileSync(SECRET_PATH, secret, { mode: 0o600, flag: 'wx' });
-    } else {
-      fs.writeFileSync(SECRET_PATH, secret, { mode: 0o600 });
-    }
-    secureSecretFile();
-    return secret;
-  } catch (err) {
-    if (err.code === 'EEXIST') {
-      // Lost a first-boot race: whatever the other process wrote is authoritative.
-      // Re-check with lstat so a symlink planted in the race is never followed.
-      if (!fs.lstatSync(SECRET_PATH).isFile()) {
-        console.error(`[hub] FATAL: ${SECRET_PATH} is not a regular file; refusing to use it`);
-        process.exit(1);
-      }
-      const raced = fs.readFileSync(SECRET_PATH);
-      if (raced.length >= SECRET_BYTES) { secureSecretFile(); return raced; }
-      console.warn(`[hub] ${SECRET_PATH} is still too short; using an in-memory secret`);
-      return secret;
-    }
-    console.error(`[hub] cannot persist the cookie secret: ${err.message}; using an in-memory secret`);
-    return secret;
-  }
+  return entry;
 }
 
-const SECRET = loadOrCreateSecret();
-
-if (SECRET.length < SECRET_BYTES) {
-  console.error(`[hub] FATAL: cookie secret is shorter than ${SECRET_BYTES} bytes`);
-  process.exit(1);
-}
-
-try {
-  if (fs.statSync(RUNTIME_DIR).mode & 0o022) {
-    console.warn(`[hub] WARNING: ${RUNTIME_DIR} is group/other-writable; another local user could replace ${SECRET_PATH}`);
+setInterval(() => {
+  const cutoff = Date.now() - CFG.sessionTtlMs - CFG.fingerprintTtlMs;
+  for (const [user, entry] of USERS) {
+    if (entry.lastUsed < cutoff) USERS.delete(user);
   }
-} catch { /* the runtime directory is created/validated elsewhere */ }
+}, 60_000).unref();
 
-function sign(user, exp) {
-  return crypto.createHmac('sha256', SECRET).update(`${user}.${exp}`).digest('base64url');
+function sign(user, exp, key) {
+  return crypto.createHmac('sha256', key).update(`${user}.${exp}`).digest('base64url');
 }
 
-function makeCookie(user) {
+function makeCookie(user, key) {
   const exp = Date.now() + CFG.sessionTtlMs;
-  return `${user}.${exp}.${sign(user, exp)}`;
+  return `${user}.${exp}.${sign(user, exp, key)}`;
 }
 
 function parseCookie(req) {
@@ -125,7 +146,12 @@ export function sessionUser(req) {
   const [, user, expStr, sig] = m;
   const exp = Number(expStr);
   if (!Number.isFinite(exp) || exp < Date.now()) return null;
-  const expect = sign(user, exp);
+  // Only users that logged in since this process started have a key here; a
+  // forged cookie for any other name is rejected without touching NSS.
+  if (USERS.get(user) === undefined) return null;
+  const credential = credentialFor(user);
+  if (credential === null || (!credential.hasPassword && !CFG.allowNoPassword)) return null;
+  const expect = sign(user, exp, credential.key);
   const a = Buffer.from(sig), b = Buffer.from(expect);
   if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
   return user;
@@ -438,10 +464,14 @@ export async function handleLogin(req, res) {
     releaseAttempt(ip, !pamOk);
   }
   let reason = '';
+  let credential = null;
   if (!pamOk) reason = 'auth-failed';
-  else if (CFG.allowUsers.length && !CFG.allowUsers.includes(username)) {
-    recordFailure(ip);
-    reason = 'not-allowed';
+  else {
+    credential = credentialFor(username, true);
+    if (credential === null) reason = 'shadow-unavailable';
+    else if (!credential.hasPassword && !CFG.allowNoPassword) reason = 'no-password';
+    else if (CFG.allowUsers.length && !CFG.allowUsers.includes(username)) reason = 'not-allowed';
+    if (reason !== '') recordFailure(ip);
   }
   if (reason !== '') {
     const blocked = loginBlockSeconds(ip);
@@ -451,7 +481,7 @@ export async function handleLogin(req, res) {
     return;
   }
   audit(`login ok user=${logToken(username)} ip=${logToken(ip)}${via}`);
-  const token = makeCookie(username);
+  const token = makeCookie(username, credential.key);
   res.writeHead(303, {
     'set-cookie': `${CFG.cookieName}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(CFG.sessionTtlMs / 1000)}`,
     location: '/',

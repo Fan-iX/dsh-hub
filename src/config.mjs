@@ -72,7 +72,7 @@ export const CFG = {
   hubHost: process.env.HUB_HOST ?? '0.0.0.0',
   hubPort: int(process.env.HUB_PORT, 3080),
   dshBin: detectDshBin(),
-  sessionTtlMs: int(process.env.SESSION_TTL_MS, 7 * 24 * 3600 * 1000),
+  sessionTtlMs: int(process.env.SESSION_TTL_MS, 24 * 3600 * 1000),
   // 0 disables culling entirely — backends keep running with the browser
   // closed, JupyterHub/tmux-style. Pick a positive value to reap idle ones.
   idleCullMs: intOrZero(process.env.IDLE_CULL_MS, 4 * 3600 * 1000),
@@ -103,6 +103,12 @@ export const CFG = {
   // Existing account whose password check runs for unknown usernames, so the
   // response time does not reveal whether an account exists. Empty disables it.
   authDecoyUser: process.env.AUTH_DECOY_USER ?? 'nobody',
+  // A shadow entry with no usable password is denied a session unless this is
+  // set. Empty/locked hashes (`!`, `*`, `x`) count as no password.
+  allowNoPassword: process.env.ALLOW_NOPASSWD === '1',
+  // How long a derived per-user key is trusted before the shadow entry is
+  // re-read (`/etc/shadow` mtime changes also force a refresh).
+  fingerprintTtlMs: int(process.env.FINGERPRINT_TTL_MS, 60_000),
   // Comma-separated IPs/CIDRs whose X-Forwarded-For / X-Real-IP may be trusted.
   // Empty (the default) always uses the TCP peer address and ignores both.
   trustedProxies: (process.env.TRUSTED_PROXIES ?? '')
@@ -117,10 +123,9 @@ export const AUTH_LOG_FILE = process.env.HUB_AUTH_LOG ?? path.join(CFG.logDir, '
 export const IS_ROOT = process.getuid?.() === 0;
 export const IPTABLES = IS_ROOT && hasBin('iptables');
 
-// Runtime state (the signing secret and the session-list cache) lives in the
-// launch directory — the service's WorkingDirectory — not in the checkout,
-// which may be read-only or shared after deployment. Both paths are therefore
-// resolved from the process working directory, not relative to this module.
+// Runtime state (the session-list cache) lives in the launch directory — the
+// service's WorkingDirectory — not in the checkout, which may be read-only or
+// shared after deployment. The path is therefore resolved from the process
+// working directory, not relative to this module.
 export const RUNTIME_DIR = process.cwd();
-export const SECRET_PATH = process.env.COOKIE_SECRET_FILE ?? path.join(RUNTIME_DIR, '.cookie-secret');
 export const CACHE_DIR = path.join(RUNTIME_DIR, 'cache');

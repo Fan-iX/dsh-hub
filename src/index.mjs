@@ -22,7 +22,7 @@
 import fs from 'node:fs';
 
 import {
-  AUTH_LOG_FILE, CACHE_DIR, CFG, IPTABLES, IS_ROOT, SECRET_PATH, TRUSTED_HOSTS, TRUST_MODE,
+  AUTH_LOG_FILE, CACHE_DIR, CFG, IPTABLES, IS_ROOT, TRUSTED_HOSTS, TRUST_MODE,
 } from './config.mjs';
 import { loadPersistedCache } from './session-list-cache.mjs';
 import { createHubServer } from './server.mjs';
@@ -51,8 +51,8 @@ server.listen(CFG.hubPort, CFG.hubHost, () => {
     + (CFG.trustedProxies.length ? `, trusting X-Forwarded-For from ${CFG.trustedProxies.join(', ')}` : ', using the TCP peer address only'));
   console.log(`[hub] auth audit log: ${AUTH_LOG_FILE}`);
   console.log(CFG.cleanOnStop
-    ? `[hub] on SIGTERM/SIGINT/SIGHUP: stop instances and remove ${CACHE_DIR} + ${SECRET_PATH}`
-    : '[hub] on stop: instances stopped, cache and cookie secret kept (HUB_CLEAN_ON_STOP=0)');
+    ? `[hub] on SIGTERM/SIGINT/SIGHUP: stop instances and remove ${CACHE_DIR}`
+    : '[hub] on stop: instances stopped, cache kept (HUB_CLEAN_ON_STOP=0)');
   console.log(CFG.idleCullMs === 0
     ? '[hub] idle culling DISABLED — backends run until stopped'
     : `[hub] idle cull after ${Math.round(CFG.idleCullMs / 60000)} min`);

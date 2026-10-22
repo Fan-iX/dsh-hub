@@ -1,10 +1,9 @@
 // Graceful stop for the whole hub: kill every spawned instance's process group,
-// release its loopback guard, delete the persisted cache and cookie secret, and
-// exit. Cleanup is best-effort and bounded so a wedged backend can never keep
-// the process alive.
+// release its loopback guard, delete the persisted cache, and exit. Cleanup is
+// best-effort and bounded so a wedged backend can never keep the process alive.
 import fs from 'node:fs';
 
-import { CACHE_DIR, CFG, SECRET_PATH } from './config.mjs';
+import { CACHE_DIR, CFG } from './config.mjs';
 import { backends, removeGuard } from './backends.mjs';
 
 let shuttingDown = false;
@@ -27,22 +26,17 @@ function forceKillBackends() {
   }
 }
 
-/** Delete the persisted cache and the cookie secret unless cleanup is disabled. */
+/** Delete the persisted cache unless cleanup is disabled. */
 function removeRuntimeState() {
   if (!CFG.cleanOnStop) {
-    console.log('[hub] HUB_CLEAN_ON_STOP=0: keeping cache and cookie secret');
+    console.log('[hub] HUB_CLEAN_ON_STOP=0: keeping cache');
     return;
   }
-  for (const [what, target, options] of [
-    ['cache', CACHE_DIR, { recursive: true, force: true }],
-    ['cookie secret', SECRET_PATH, { force: true }],
-  ]) {
-    try {
-      fs.rmSync(target, options);
-      console.log(`[hub] removed ${what} ${target}`);
-    } catch (err) {
-      console.error(`[hub] ${what} cleanup failed:`, err.message);
-    }
+  try {
+    fs.rmSync(CACHE_DIR, { recursive: true, force: true });
+    console.log(`[hub] removed cache ${CACHE_DIR}`);
+  } catch (err) {
+    console.error('[hub] cache cleanup failed:', err.message);
   }
 }
 
