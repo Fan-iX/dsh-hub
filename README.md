@@ -263,6 +263,13 @@ fall back to stdout/journald.
   static loading page (auto-refresh every 3 s) while the spawn runs in the
   background, then reloads into the app. Other requests during startup get
   `503` + `Retry-After: 3`; a spawn failure surfaces as a `503` page.
+- Readiness is checked at the HTTP layer (a no-token `GET /`), not just TCP, so
+  a port that accepts connections before dsh's web handler is ready does not
+  turn the loading page into a `502`. If a connection error still reaches the
+  proxy before the first response, an index request gets the same loading page
+  and other requests get `503` with `Retry-After`. After an instance has served
+  a response, a connection failure is a real `502`; reloading starts a new
+  instance if it exited.
 - Idle culling measures real traffic: every proxied request, every byte of a
   streaming response, and every frame of the WebSocket event stream refresh the
   instance. An instance with an attached event stream or the keep-alive switch
