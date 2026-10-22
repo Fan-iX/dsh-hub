@@ -100,6 +100,9 @@ export const CFG = {
   // oldest counted failure ages out of the window.
   authWindowMs: int(process.env.AUTH_WINDOW_MS, 10 * 60 * 1000),
   authMaxFailures: int(process.env.AUTH_MAX_FAILURES, 5),
+  // Existing account whose password check runs for unknown usernames, so the
+  // response time does not reveal whether an account exists. Empty disables it.
+  authDecoyUser: process.env.AUTH_DECOY_USER ?? 'nobody',
   // Comma-separated IPs/CIDRs whose X-Forwarded-For / X-Real-IP may be trusted.
   // Empty (the default) always uses the TCP peer address and ignores both.
   trustedProxies: (process.env.TRUSTED_PROXIES ?? '')
