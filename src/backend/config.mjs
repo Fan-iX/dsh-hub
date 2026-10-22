@@ -1,6 +1,6 @@
-// Environment-derived configuration, deployment paths, and host facts. Every
-// value is read once at startup; the rest of the hub imports the resolved
-// constants instead of touching process.env.
+// Shared environment-derived configuration, deployment paths, and host facts.
+// Values common to both the multi-user hub and the single-user proxy live here;
+// mode-specific settings live in hub/config.mjs and proxy/config.mjs.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -44,7 +44,7 @@ export function detectDshBin() {
   if (process.env.DSH_BIN) return process.env.DSH_BIN;
   const candidates = [
     // local installation with `npm install @deepseek-ai/dsh`
-    path.resolve(__dirname, '../node_modules/.bin/dsh'),
+    path.resolve(__dirname, '../../node_modules/.bin/dsh'),
     // system global installation with `npm install -g @deepseek-ai/dsh`
     '/usr/local/bin/dsh',
     '/usr/bin/dsh',
@@ -68,33 +68,19 @@ export function hasBin(name) {
   return false;
 }
 
-export const CFG = {
+/** Settings shared by both entry points. */
+export const BASE = {
   hubHost: process.env.HUB_HOST ?? '0.0.0.0',
   hubPort: int(process.env.HUB_PORT, 3080),
   dshBin: detectDshBin(),
   sessionTtlMs: int(process.env.SESSION_TTL_MS, 24 * 3600 * 1000),
-  // 0 disables culling entirely — backends keep running with the browser
-  // closed, JupyterHub/tmux-style. Pick a positive value to reap idle ones.
+  // 0 disables culling entirely. A positive value reaps instances that have no
+  // browser activity, no attached event stream, and no keep-alive pin.
   idleCullMs: intOrZero(process.env.IDLE_CULL_MS, 4 * 3600 * 1000),
-  // How often the idle culler looks. A backend with an attached event stream is
-  // never reaped, so this is only the checking cadence, not a second timeout.
   cullIntervalMs: int(process.env.CULL_INTERVAL_MS, 60_000),
-  // Admin-maintained global dsh overlays (`*.yml` drop-ins) applied to every
-  // instance the hub spawns, in file-name order. Non-secret, world-readable.
-  webConfigDir: process.env.HUB_WEB_CONFIG_DIR ?? '/etc/dsh-hub/web_config.d',
   spawnTimeoutMs: int(process.env.SPAWN_TIMEOUT_MS, 60_000),
-  cookieName: 'dshhub_session',
-  // Optional comma-separated allow-list of usernames. Empty = all system users.
-  allowUsers: (process.env.ALLOW_USERS ?? '')
-    .split(',').map((s) => s.trim()).filter(Boolean),
-  logDir: process.env.HUB_LOG_DIR ?? '/var/log/dsh-hub',
-  // On SIGTERM/SIGINT/SIGHUP: stop every spawned instance, then delete the
-  // persisted session-list cache and the cookie-signing secret. Set
-  // HUB_CLEAN_ON_STOP=0 to keep them (a plain restart should not log every
-  // browser out). The grace period bounds how long a backend may take to exit
-  // before it is SIGKILLed.
-  cleanOnStop: process.env.HUB_CLEAN_ON_STOP !== '0',
   shutdownGraceMs: int(process.env.SHUTDOWN_GRACE_MS, 5000),
+  cookieName: 'dshhub_session',
   // Login guard: failures are counted per client IP inside a sliding window.
   // Reaching AUTH_MAX_FAILURES within AUTH_WINDOW_MS answers 429 until the
   // oldest counted failure ages out of the window.
@@ -103,25 +89,13 @@ export const CFG = {
   // Existing account whose password check runs for unknown usernames, so the
   // response time does not reveal whether an account exists. Empty disables it.
   authDecoyUser: process.env.AUTH_DECOY_USER ?? 'nobody',
-  // A shadow entry with no usable password is denied a session unless this is
-  // set. Empty/locked hashes (`!`, `*`, `x`) count as no password.
-  allowNoPassword: process.env.ALLOW_NOPASSWD === '1',
-  // How long a derived per-user key is trusted before the shadow entry is
-  // re-read (`/etc/shadow` mtime changes also force a refresh).
-  fingerprintTtlMs: int(process.env.FINGERPRINT_TTL_MS, 60_000),
   // Comma-separated IPs/CIDRs whose X-Forwarded-For / X-Real-IP may be trusted.
   // Empty (the default) always uses the TCP peer address and ignores both.
   trustedProxies: (process.env.TRUSTED_PROXIES ?? '')
     .split(',').map((s) => s.trim()).filter(Boolean),
 };
 
-// Append-only authentication audit log: one stable line per login outcome,
-// tagged with the resolved client IP, so an external log-driven banner can
-// filter and ban without the hub keeping its own ban list.
-export const AUTH_LOG_FILE = process.env.HUB_AUTH_LOG ?? path.join(CFG.logDir, 'auth.log');
-
 export const IS_ROOT = process.getuid?.() === 0;
-export const IPTABLES = IS_ROOT && hasBin('iptables');
 
 // Runtime state (the session-list cache) lives in the launch directory — the
 // service's WorkingDirectory — not in the checkout, which may be read-only or

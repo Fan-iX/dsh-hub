@@ -1,20 +1,27 @@
-// HTTP router: authentication gate, cold-start loading page, session-list
-// cache interception, and forwarding to the backend through the proxy.
-import { TRUST_MODE } from './config.mjs';
-import { backends, getOrCreateBackend } from './backends.mjs';
-import { proxy } from './proxy.mjs';
-import { bridgeDshBrowserSession, hubDshCookieHeader, isIndexPath } from './browser-session.mjs';
-import { sendHtml, readRequestBody } from './http.mjs';
-import { localeFromRequest, languageCookie, t } from './i18n.mjs';
-import { loginPage, startingPage } from './pages.mjs';
-import { lookupUser } from './users.mjs';
-import { handleLogin, handleLogout, sessionUser } from './auth.mjs';
-import { handleKeepAlive } from './keepalive.mjs';
+// Multi-user HTTP entry: authentication gate, cold-start page, session-list
+// cache interception, per-user forwarding, and the WebSocket upgrade path.
+import http from 'node:http';
+
+import { AUTH_LOG_FILE, CFG, TRUST_MODE } from './config.mjs';
+import { createLogin } from '../backend/auth.mjs';
+import {
+  bridgeDshBrowserSession, hubDshCookieHeader, isIndexPath, proxy,
+} from '../backend/dsh-proxy.mjs';
+import {
+  handleKeepAlive, localeFromRequest, loginPage, pageHeaders, readRequestBody, sendHtml,
+  startingPage, t,
+} from '../backend/web.mjs';
+import { keyFor, lookupUser, verify } from './accounts.mjs';
+import { backends, getOrCreateBackend } from './instances.mjs';
 import {
   SESSION_LIST_PATH, deferSessionList, forwardSessionList, isCacheableSessionList,
   requestRpcId, revalidateSessionList, rpcCache, serveCachedSessionList,
   sessionListCacheKey, storeSessionList,
 } from './session-list-cache.mjs';
+
+const { handleLogin, handleLogout, sessionUser } = createLogin({
+  verify, keyFor, auditPath: AUTH_LOG_FILE, cfg: CFG,
+});
 
 // Spawns running in the background, and the last spawn failure per user. A
 // request that needs a cold backend starts the spawn here and answers at once
@@ -33,14 +40,6 @@ function startBackendInBackground(user) {
       spawnFailures.set(user, err.message);
     })
     .finally(() => spawnInflight.delete(user));
-}
-
-/** Locale headers for a hub-rendered page, persisting an explicit `?lang=`. */
-function pageHeaders(req, locale) {
-  const headers = { 'content-language': locale, vary: 'Accept-Language' };
-  const cookie = languageCookie(req);
-  if (cookie !== undefined) headers['set-cookie'] = cookie;
-  return headers;
 }
 
 export async function route(req, res) {
@@ -71,12 +70,12 @@ export async function route(req, res) {
     return;
   }
   if (url.pathname === '/hub/api/keepalive') {
-    await handleKeepAlive(req, res, user);
+    await handleKeepAlive(req, res, backends.get(user));
     return;
   }
 
   // Session-list RPC cache: serve the last known snapshot forever (serve-stale),
-  // refresh it in the background on a throttle (see block above).
+  // refresh it in the background on a throttle (see the cache module).
   if (req.method === 'POST' && url.pathname === SESSION_LIST_PATH) {
     const body = await readRequestBody(req);
     const key = sessionListCacheKey(user, body);
@@ -84,7 +83,7 @@ export async function route(req, res) {
     const now = Date.now();
     if (entry) {
       const be = backends.get(user);
-      if (be) be.lastActivity = Date.now(); // a cache hit is browser activity too
+      if (be) be.touch(); // a cache hit is browser activity too
       serveCachedSessionList(res, entry, requestRpcId(body));
       if (now >= entry.nextRevalidateAt && !entry.inflight) {
         entry.inflight = true;
@@ -106,7 +105,7 @@ export async function route(req, res) {
       sendHtml(res, 503, `<pre>dsh-hub: fail to launch\n${err.message}</pre>`);
       return;
     }
-    be.lastActivity = Date.now();
+    be.touch();
     req.headers.origin = `http://127.0.0.1:${be.port}`;
     req.headers['accept-encoding'] = 'identity';
     // Present the hub's own cookie for this backend, not the browser's: after a
@@ -158,7 +157,7 @@ export async function route(req, res) {
     return;
   }
   spawnFailures.delete(user);
-  be.lastActivity = Date.now();
+  be.touch();
   req.hubBackend = be; // lets the proxy 401 handler re-mint dsh's session cookie
   // First navigation of an authenticated session: mint dsh's own browser-session
   // cookie before touching the backend, so the index never answers 401.
@@ -175,10 +174,58 @@ export async function route(req, res) {
     // Also inject Origin when the browser omitted it entirely (service-worker
     // or extension re-fetches drop Origin/Sec-Fetch-* headers): plugin guards
     // like task-board's browser-marker check need one of the two, and this
-    // request already passed the hub's PAM cookie authentication.
+    // request already passed the session cookie authentication.
     req.headers.origin = `http://127.0.0.1:${be.port}`;
   }
-  // Force identity encoding so the HTML rewrite below sees plain text.
+  // Force identity encoding so the HTML rewrite sees plain text.
   req.headers['accept-encoding'] = 'identity';
   proxy.web(req, res, { target: `http://127.0.0.1:${be.port}` });
+}
+
+/**
+ * Create the multi-user HTTP server with its request and upgrade handlers.
+ * @returns the listening-ready server (caller owns `listen`).
+ */
+export function createHubServer() {
+  const server = http.createServer((req, res) => {
+    route(req, res).catch((err) => {
+      console.error('[hub] handler error:', err);
+      if (!res.headersSent) res.writeHead(500);
+      res.end('dsh-hub: internal error');
+    });
+  });
+
+  // WebSocket upgrade (dsh event streams) — routed by the same session cookie.
+  server.on('upgrade', (req, socket, head) => {
+    const user = sessionUser(req);
+    if (!user) {
+      socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    const be = backends.get(user);
+    if (!be || !be.child || be.child.exitCode !== null) {
+      socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    be.touch();
+    // An attached event stream is live use: count it so the idle culler never
+    // reaps a backend whose browser is still watching (a long agent turn or a
+    // background job can run for hours without a single HTTP request). dsh
+    // heartbeats the stream every 2s and the client answers, so `data` keeps
+    // arriving; the count alone is the stronger guard.
+    be.wsClients += 1;
+    socket.on('data', () => be.touch());
+    socket.on('close', () => {
+      be.wsClients = Math.max(0, be.wsClients - 1);
+      be.touch(); // the idle window starts when the stream detaches
+    });
+    if (TRUST_MODE === 'origin-rewrite') {
+      req.headers.origin = `http://127.0.0.1:${be.port}`;
+    }
+    proxy.ws(req, socket, head, { target: `http://127.0.0.1:${be.port}` });
+  });
+
+  return server;
 }

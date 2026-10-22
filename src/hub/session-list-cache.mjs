@@ -6,8 +6,8 @@ import http from 'node:http';
 import path from 'node:path';
 
 import { CACHE_DIR } from './config.mjs';
-import { hubDshCookieHeader } from './browser-session.mjs';
-import { sanitizeForwardHeaders } from './http.mjs';
+import { hubDshCookieHeader } from '../backend/dsh-proxy.mjs';
+import { sanitizeForwardHeaders } from '../backend/web.mjs';
 
 // ------------------------------------------- /api/session/list response cache --
 // dsh's session/list recomputes projections for every session (zstd-decode of

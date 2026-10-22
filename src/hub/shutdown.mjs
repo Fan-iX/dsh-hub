@@ -1,27 +1,18 @@
-// Graceful stop for the whole hub: kill every spawned instance's process group,
-// release its loopback guard, delete the persisted cache, and exit. Cleanup is
-// best-effort and bounded so a wedged backend can never keep the process alive.
+// Graceful stop for the multi-user hub: kill every spawned instance's process
+// group, release its loopback guard, delete the persisted cache, and exit.
+// Cleanup is best-effort and bounded so a wedged backend can never keep the
+// process alive.
 import fs from 'node:fs';
 
 import { CACHE_DIR, CFG } from './config.mjs';
-import { backends, removeGuard } from './backends.mjs';
+import { backends, removeGuard } from './instances.mjs';
 
 let shuttingDown = false;
-
-/** Signal one backend's whole process group, falling back to the direct child. */
-function killBackendTree(be, signal) {
-  if (!be?.child || be.child.exitCode !== null) return;
-  try {
-    process.kill(-be.child.pid, signal); // detached spawn ⇒ negative pid = its group
-  } catch {
-    try { be.child.kill(signal); } catch { /* already gone */ }
-  }
-}
 
 /** SIGKILL every live backend and release its loopback guard. */
 function forceKillBackends() {
   for (const be of backends.values()) {
-    killBackendTree(be, 'SIGKILL');
+    be.kill('SIGKILL');
     removeGuard(be.port, be.info.uid);
   }
 }
@@ -58,7 +49,7 @@ export function createShutdown(server) {
     try { server.close(); } catch { /* already closing */ }
 
     const pending = [...backends.values()].filter((be) => be.child && be.child.exitCode === null);
-    for (const be of pending) killBackendTree(be, 'SIGTERM');
+    for (const be of pending) be.kill('SIGTERM');
 
     const deadline = Date.now() + CFG.shutdownGraceMs;
     let finished = false;
