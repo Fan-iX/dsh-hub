@@ -3,6 +3,7 @@
 // entry points use this class; the multi-user hub keeps a Map of them, the
 // single-user proxy keeps exactly one.
 import fs from 'node:fs';
+import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -33,6 +34,55 @@ function waitTcp(port, timeoutMs) {
   });
 }
 
+/**
+ * Wait until dsh's HTTP layer actually answers. A bare TCP accept is not
+ * enough: dsh can bind the port before its web handler is ready (or close and
+ * reopen it while starting), which would make the proxy forward too early and
+ * surface a 502. Any non-5xx response means the server is serving; the normal
+ * no-token index answer is 401.
+ */
+function waitHttp(port, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (err) => {
+      if (settled) return;
+      settled = true;
+      if (err) reject(err); else resolve();
+    };
+    function tryOnce() {
+      if (settled) return;
+      if (Date.now() > deadline) {
+        finish(new Error(`backend HTTP did not respond within ${timeoutMs}ms`));
+        return;
+      }
+      let attemptDone = false;
+      const again = () => {
+        if (attemptDone || settled) return;
+        attemptDone = true;
+        setTimeout(tryOnce, 300);
+      };
+      let req;
+      try {
+        req = http.get({
+          host: '127.0.0.1', port, path: '/', timeout: 2000,
+          headers: { connection: 'close' },
+        }, (res) => {
+          res.resume();
+          if (res.statusCode < 500) finish();
+          else again();
+        });
+      } catch {
+        again();
+        return;
+      }
+      req.on('timeout', () => { req.destroy(); again(); });
+      req.on('error', () => again());
+    }
+    tryOnce();
+  });
+}
+
 /** Open an owner-only dsh log, or null when the path is unusable. */
 function openLog(logPath) {
   if (!logPath) return null;
@@ -57,6 +107,8 @@ export class DshInstance {
     this.child = null;
     this.ready = null;          // promise resolved when TCP accepts
     this.starting = false;
+    this.startedAt = null;      // when the HTTP readiness probe succeeded
+    this.healthy = false;       // set once a proxied response has been received
     this.lastActivity = Date.now();
     this.launchToken = null;    // one-shot browser-session token, parsed from stdout
     this.launchTokenUnavailable = false;
@@ -120,7 +172,11 @@ export class DshInstance {
       this.log = null;
       this.onExit?.(this);
     });
-    await waitTcp(this.port, this.opts.spawnTimeoutMs ?? 60_000);
+    const timeoutMs = this.opts.spawnTimeoutMs ?? 60_000;
+    const deadline = Date.now() + timeoutMs;
+    await waitTcp(this.port, Math.max(1, deadline - Date.now()));
+    await waitHttp(this.port, Math.max(1, deadline - Date.now()));
+    this.startedAt = Date.now();
     this.lastActivity = Date.now();
     this.onStarted?.(this);
     return this;

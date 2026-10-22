@@ -120,6 +120,7 @@ export async function route(req, res) {
       // Backend died between spawn and forward (cull/restart race): fall back
       // to the streaming proxy, which re-triggers the spawn-on-demand path.
       console.error(`[hub] session.list forward failed for ${user}:`, err.message);
+      req.hubBackend = be; // lets the proxy error handler classify a startup race
       proxy.web(req, res, { target: `http://127.0.0.1:${be.port}` });
       return;
     }
@@ -204,7 +205,7 @@ export function createHubServer() {
       return;
     }
     const be = backends.get(user);
-    if (!be || !be.child || be.child.exitCode !== null) {
+    if (!be || !be.child || be.child.exitCode !== null || be.starting) {
       socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
       socket.destroy();
       return;

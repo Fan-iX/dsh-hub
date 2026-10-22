@@ -159,7 +159,7 @@ export function createProxyServer() {
       return;
     }
     const be = instance;
-    if (!be || !be.child || be.child.exitCode !== null) {
+    if (!be || !be.child || be.child.exitCode !== null || be.starting) {
       socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
       socket.destroy();
       return;

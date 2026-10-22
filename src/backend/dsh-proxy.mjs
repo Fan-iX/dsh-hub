@@ -6,6 +6,11 @@ import http from 'node:http';
 import httpProxy from 'http-proxy';
 
 import { TRUST_MODE } from './config.mjs';
+import { localeFromRequest, pageHeaders, sendHtml, startingPage, t } from './web.mjs';
+
+// A proxy connection error is treated as a startup transient only until the
+// instance has served its first response and for a short grace after readiness.
+const STARTUP_GRACE_MS = 10_000;
 
 // ---------------------------------------------------------------- proxy -----
 
@@ -70,7 +75,10 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
   const be = req.hubBackend;
   // A response that keeps streaming (long poll / SSE) is live use too, so the
   // idle culler counts its bytes as activity, not just the request that opened it.
-  if (be) proxyRes.on('data', () => be.touch());
+  if (be) {
+    be.healthy = true; // dsh's HTTP layer answered; later errors are not startup
+    proxyRes.on('data', () => be.touch());
+  }
   // dsh refused the index with 401: the browser either has no dsh cookie yet or
   // holds a stale one. Re-mint it from the launch token and redirect, instead of
   // surfacing "reopen the URL printed by dsh web". The throttle stops a redirect
@@ -115,12 +123,42 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
 
 proxy.on('error', (err, req, res) => {
   console.error('[hub] proxy error:', err.message);
-  if (res instanceof http.ServerResponse) {
-    if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
-    res.end('dsh-hub: backend unavailable\n');
-  } else if (res?.destroy) {
-    res.destroy();
+  // WebSocket upgrades have no ServerResponse; let the client reconnect.
+  if (!(res instanceof http.ServerResponse)) {
+    if (res?.destroy) res.destroy();
+    return;
   }
+  if (res.headersSent || res.writableEnded) {
+    try { res.end(); } catch { /* already gone */ }
+    return;
+  }
+  if (res.destroyed) return;
+  if (req === undefined) {
+    res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('dsh-hub: backend unavailable\n');
+    return;
+  }
+  const be = req.hubBackend;
+  const starting = be !== undefined && (
+    be.starting === true
+    || (be.healthy !== true && Date.now() - (be.startedAt ?? 0) < STARTUP_GRACE_MS)
+  );
+  const pathname = new URL(String(req?.url ?? '/'), 'http://x').pathname;
+  const index = req?.method === 'GET' && isIndexPath(pathname);
+  const locale = localeFromRequest(req);
+  // The index during startup gets the same loading page as the router's cold
+  // start; anything else must stay a retryable non-HTML response.
+  if (starting && index) {
+    sendHtml(res, 200, startingPage(locale), pageHeaders(req, locale));
+    return;
+  }
+  if (starting) {
+    res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8', 'retry-after': '3' });
+    res.end(`${t(locale, 'error.starting')}\n`);
+    return;
+  }
+  res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
+  res.end('dsh-hub: backend unavailable\n');
 });
 
 // --------------------------------------------- dsh browser-session bridge ----
