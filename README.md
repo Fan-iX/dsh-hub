@@ -63,7 +63,7 @@ sudo service dsh-hub start
 ```
 
 All three start the hub as root from `/var/lib/dsh-hub` — the working directory
-that holds the cookie secret and the session cache — and accept the
+that holds the session cache — and accept the
 [configuration](#configuration) environment variables. The hub's own defaults
 (`HUB_PORT=3080`, `HUB_LOG_DIR=/var/log/dsh-hub`) apply unless you override them
 in the init-system config file: `/etc/conf.d/dsh-hub` (OpenRC) or
@@ -92,11 +92,10 @@ username/password**, and get a private dsh instance.
 | `IDLE_CULL_MS` | `14400000` (4h) | `0` disables culling — backends keep running with the browser closed |
 | `CULL_INTERVAL_MS` | `60000` (1 min) | how often the culler checks; an attached event stream is never reaped |
 | `HUB_WEB_CONFIG_DIR` | `/etc/dsh-hub/web_config.d` | `*.yml` drop-ins applied as `--patch` to spawned instances, in file-name order (non-secret, world-readable) |
-| `SESSION_TTL_MS` | 7 days | cookie lifetime |
+| `SESSION_TTL_MS` | 1 day | cookie lifetime |
 | `ALLOW_USERS` | *(all)* | comma-separated username allow-list |
 | `HUB_LOG_DIR` | `/var/log/dsh-hub` | per-user backend logs |
-| `COOKIE_SECRET_FILE` | `$CWD/.cookie-secret` | HMAC secret (auto-generated, `0600`) |
-| `HUB_CLEAN_ON_STOP` | `1` | on `SIGTERM`/`SIGINT`/`SIGHUP`, stop instances and delete `$CWD/cache` + the cookie secret; `0` keeps them |
+| `HUB_CLEAN_ON_STOP` | `1` | on `SIGTERM`/`SIGINT`/`SIGHUP`, stop instances and delete `$CWD/cache`; `0` keeps it |
 | `SHUTDOWN_GRACE_MS` | `5000` | how long a backend may take to exit before it is `SIGKILL`ed |
 | `AUTH_WINDOW_MS` | `600000` (10 min) | sliding window for failed logins per client IP |
 | `AUTH_MAX_FAILURES` | `5` | failures within the window before `/hub/login` answers `429` |
@@ -121,7 +120,7 @@ is split by responsibility:
 | File | Responsibility |
 |---|---|
 | `index.mjs` | composition root: build the server, register signal handling, listen |
-| `config.mjs` | environment → `CFG`, runtime paths (`SECRET_PATH`, `CACHE_DIR`, `AUTH_LOG_FILE`), trust mode, dsh binary detection |
+| `config.mjs` | environment → `CFG`, runtime paths (`CACHE_DIR`, `AUTH_LOG_FILE`), trust mode, dsh binary detection |
 | `server.mjs` | HTTP server plus the WebSocket upgrade path routed by session cookie |
 | `router.mjs` | request gate, cold-start page, session-list interception, backend bridging and proxying |
 | `auth.mjs` | session cookies, client-IP resolution, sliding-window guard, audit log, PAM verification, login/logout |
@@ -135,7 +134,7 @@ is split by responsibility:
 | `browser-session.mjs` | dsh launch-token capture and the `dsh-auth-*` cookie bridge |
 | `session-list-cache.mjs` | serve-stale `/api/session/list` cache |
 | `proxy.mjs` | `http-proxy` instance, HTML injections, dsh `401` bridge |
-| `shutdown.mjs` | signal teardown: kill instances, remove cache and cookie secret, exit |
+| `shutdown.mjs` | signal teardown: kill instances, remove cache, exit |
 
 ### Bilingual pages
 
@@ -346,17 +345,15 @@ opened, lines fall back to stdout/journald.
   Non-index requests during startup get `503` + `Retry-After: 3` instead of
   blocking, and a spawn failure surfaces as `dsh-hub: fail to lauch dsh`.
 - Runtime state lives in the **working directory the hub is started from**
-  (`WorkingDirectory` under systemd), never in the checkout: the HMAC secret at
-  `$CWD/.cookie-secret` and the persisted `session.list` cache under
-  `$CWD/cache/`. Point a service at a writable data directory and the source
-  tree can stay read-only.
+  (`WorkingDirectory` under systemd), never in the checkout: the persisted
+  `session.list` cache lives under `$CWD/cache/`. Point a service at a writable
+  data directory and the source tree can stay read-only.
 - On `SIGTERM`/`SIGINT`/`SIGHUP` the hub stops every spawned dsh instance (their
   whole process group, `SIGTERM` then `SIGKILL` after `SHUTDOWN_GRACE_MS`),
-  releases their loopback guards, and deletes the persisted cache and the cookie
-  secret — so a stopped hub leaves no running instances and no reusable session
-  material behind. Cleanup is bounded and best-effort; a second signal exits
-  immediately. Set `HUB_CLEAN_ON_STOP=0` to keep the cache and secret across
-  restarts.
+  releases their loopback guards, and deletes the persisted cache — so a stopped
+  hub leaves no running instances behind. Cleanup is bounded and best-effort; a
+  second signal exits immediately. Set `HUB_CLEAN_ON_STOP=0` to keep the cache
+  across restarts.
 - Conversations survive browser close: goal/server-side drivers keep running
   in the spawned dsh process; re-login reattaches to the same instance.
 - Restart after config changes: `sudo systemctl restart dsh-hub` (systemd),
