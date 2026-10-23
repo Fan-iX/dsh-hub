@@ -15,7 +15,8 @@
     "http-proxy": "^1.18.0"
   },
   "optionalDependencies": {
-    "node-linux-pam": "^0.2.1"
+    "node-linux-pam": "^0.2.1",
+    "node-pty": "^1.1.0"
   },
   "license": "MIT",
   "repository": {

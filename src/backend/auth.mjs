@@ -32,13 +32,29 @@ export function lookupUser(user) {
 }
 
 // ----------------------------------------------------------------- PAM ------
-// Two PAM paths:
+// Three password paths, most capable first:
 //  1. native `node-linux-pam` (optionalDependency; needs libpam to build)
-//  2. `su` fallback: spawn `su <user> -c 'exit 0'` as an unprivileged uid —
-//     su then verifies the TARGET user's password through PAM. Zero native
-//     deps; failed attempts land in the normal auth log.
+//  2. `su` under a PTY via `node-pty` (optionalDependency): several
+//     distributions only let `su` read the password from a terminal. The child
+//     runs as `nobody` so `su` prompts for the TARGET user's password instead of
+//     letting root bypass the check.
+//  3. legacy `su` with the password on stdin: works where `su` reads stdin
+//     (e.g. Arch), kept for installs without node-pty.
 let pamNative = null;
 try { pamNative = (await import('node-linux-pam')).default; } catch { /* optional */ }
+
+let ptySpawn = null;
+try {
+  const pty = await import('node-pty');
+  ptySpawn = (pty.default ?? pty).spawn;
+} catch { /* optional */ }
+
+const SU_TIMEOUT_MS = 10_000;
+
+if (ptySpawn === null && !(pamNative && IS_ROOT)) {
+  console.warn('[hub] auth: node-pty unavailable — the su fallback reads the password from stdin '
+    + 'and fails on distributions where su requires a terminal');
+}
 
 /** Verify `username`'s password. The caller maps false to a generic failure. */
 export function pamAuthenticate(username, password) {
@@ -50,9 +66,66 @@ export function pamAuthenticate(username, password) {
       pamNative.pamAuthenticate({ username, password }, (err) => resolve(!err));
     });
   }
+  if (ptySpawn !== null) return suViaPty(username, password);
+  return suViaStdin(username, password);
+}
+
+/**
+ * Run `su` on a pseudo-terminal and feed it the password. Some distributions
+ * only let `su` read from a terminal, which the stdin fallback cannot satisfy.
+ */
+function suViaPty(username, password) {
+  return new Promise((resolve) => {
+    let term;
+    try {
+      term = ptySpawn('su', [username, '-c', 'exit 0'], {
+        name: 'xterm-256color',
+        cols: 80,
+        rows: 24,
+        cwd: '/',
+        // Root must not let `su` bypass the check: as nobody it asks for the
+        // target user's password.
+        ...(IS_ROOT ? { uid: 65534, gid: 65534 } : {}),
+        env: { PATH: '/usr/local/bin:/usr/bin:/bin', TERM: 'xterm-256color', LANG: 'C' },
+      });
+    } catch {
+      resolve(false);
+      return;
+    }
+    let done = false;
+    let wrote = false;
+    let timer;
+    let fallback;
+    const finish = (ok) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      clearTimeout(fallback);
+      resolve(ok);
+    };
+    const writePassword = () => {
+      if (wrote) return;
+      wrote = true;
+      try { term.write(`${password}\r`); } catch { /* the exit handler settles */ }
+    };
+    timer = setTimeout(() => {
+      try { term.kill(); } catch { /* already gone */ }
+      finish(false);
+    }, SU_TIMEOUT_MS);
+    // `su` disables echo before printing its prompt, so writing on the first
+    // output keeps the password out of the echo window. The short fallback
+    // covers a `su` that refuses before prompting; the exit status decides.
+    term.onData(writePassword);
+    fallback = setTimeout(writePassword, 500);
+    term.onExit(({ exitCode }) => finish(exitCode === 0));
+  });
+}
+
+/** Legacy fallback: `su` with the password on stdin (needs a stdin-reading su). */
+function suViaStdin(username, password) {
   return new Promise((resolve) => {
     const opts = { stdio: ['pipe', 'ignore', 'ignore'] };
-    if (IS_ROOT) opts.uid = 65534; // nobody: non-root su prompts via PAM
+    if (IS_ROOT) { opts.uid = 65534; opts.gid = 65534; } // nobody: non-root su prompts via PAM
     const child = spawn('su', [username, '-c', 'exit 0'], opts);
     let done = false;
     const finish = (ok) => {
@@ -61,7 +134,7 @@ export function pamAuthenticate(username, password) {
       clearTimeout(timer);
       resolve(ok);
     };
-    const timer = setTimeout(() => { child.kill('SIGKILL'); finish(false); }, 10_000);
+    const timer = setTimeout(() => { child.kill('SIGKILL'); finish(false); }, SU_TIMEOUT_MS);
     child.on('error', () => finish(false));
     child.on('exit', (code) => finish(code === 0));
     // `su` may exit before reading the password (no tty, bad account state); an
