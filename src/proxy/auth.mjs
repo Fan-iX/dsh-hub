@@ -1,8 +1,8 @@
 // Single-user authentication: the only accepted username is the account running
-// the proxy, and its password is checked through PAM (`su <self>`), so the login
-// page keeps the same username/password contract as the multi-user hub. The
-// session key is an in-memory pepper — there is no shadow access and no secret
-// file; a proxy restart logs the browser out.
+// the proxy, and its password is checked through PAM (native first, `su <self>`
+// as the fallback), so the login page keeps the same username/password contract
+// as the multi-user hub. The session key is an in-memory pepper — there is no
+// shadow access and no secret file; a proxy restart logs the browser out.
 import crypto from 'node:crypto';
 
 import { CFG } from './config.mjs';

@@ -42,6 +42,9 @@ export function lookupUser(user) {
 //     (e.g. Arch), kept for installs without node-pty.
 let pamNative = null;
 try { pamNative = (await import('node-linux-pam')).default; } catch { /* optional */ }
+// The package's ESM interop yields the module object; a broken/incompatible
+// build must fall through to the su path rather than throw per login.
+if (pamNative !== null && typeof pamNative.pamAuthenticate !== 'function') pamNative = null;
 
 let ptySpawn = null;
 try {
@@ -51,20 +54,60 @@ try {
 
 const SU_TIMEOUT_MS = 10_000;
 
-if (ptySpawn === null && !(pamNative && IS_ROOT)) {
-  console.warn('[hub] auth: node-pty unavailable — the su fallback reads the password from stdin '
-    + 'and fails on distributions where su requires a terminal');
+// PAM codes that mean "this context could not perform the check", not "the
+// password is wrong". A real rejection (`PAM_AUTH_ERR`) must never fall through
+// to `su`: a permissive su/PAM stack could turn it into a login.
+const PAM_UNVERIFIABLE = new Set([
+  1,  // PAM_OPEN_ERR
+  2,  // PAM_SYMBOL_ERR
+  3,  // PAM_SERVICE_ERR
+  4,  // PAM_SYSTEM_ERR
+  5,  // PAM_BUF_ERR
+  8,  // PAM_CRED_INSUFFICIENT
+  9,  // PAM_AUTHINFO_UNAVAIL
+  19, // PAM_CONV_ERR
+  26, // PAM_ABORT
+  28, // PAM_MODULE_UNKNOWN
+  -1, // the addon threw or returned no code
+]);
+
+let warnedSuFallback = false;
+
+if (ptySpawn === null && pamNative === null) {
+  console.warn('[hub] auth: neither node-linux-pam nor node-pty is available — '
+    + 'password checks use the su stdin fallback, which fails where su needs a terminal');
+}
+
+/**
+ * Ask the native PAM module for one verdict.
+ * @returns `{ ok, code }`; `code` is the PAM return value when it failed.
+ */
+function nativePam(username, password) {
+  return new Promise((resolve) => {
+    try {
+      pamNative.pamAuthenticate({ username, password }, (err, code) => {
+        resolve({ ok: !err, code: Number.isInteger(code) ? code : -1 });
+      });
+    } catch {
+      resolve({ ok: false, code: -1 });
+    }
+  });
 }
 
 /** Verify `username`'s password. The caller maps false to a generic failure. */
-export function pamAuthenticate(username, password) {
-  // The native module is used by the root hub. A non-root caller (the proxy)
-  // uses the `su` path, which is what actually verifies the caller's own
-  // password through PAM without shadow access.
-  if (pamNative && IS_ROOT) {
-    return new Promise((resolve) => {
-      pamNative.pamAuthenticate({ username, password }, (err) => resolve(!err));
-    });
+export async function pamAuthenticate(username, password) {
+  // Prefer native PAM in both modes: the root hub can verify any account, and
+  // the non-root proxy verifies its own service account in-process.
+  if (pamNative !== null) {
+    const verdict = await nativePam(username, password);
+    if (verdict.ok) return true;
+    if (!PAM_UNVERIFIABLE.has(verdict.code)) return false;
+    // The PAM stack could not check here (e.g. unix_chkpwd restrictions for a
+    // non-root caller); fall back to su.
+    if (ptySpawn === null && !warnedSuFallback) {
+      warnedSuFallback = true;
+      console.warn('[hub] auth: native PAM could not verify; using the su stdin fallback');
+    }
   }
   if (ptySpawn !== null) return suViaPty(username, password);
   return suViaStdin(username, password);
