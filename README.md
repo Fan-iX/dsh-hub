@@ -215,18 +215,28 @@ Both modes render the same login form (username, password, language switcher)
 and use the same sliding-window guard and audit log.
 
 - **Hub**: the username must be an existing system account and the password is
-  verified through PAM (`node-linux-pam` when installed, otherwise `su`). The
-  cookie key is derived from the account's shadow entry plus an in-process
-  pepper, so a password change, lock, or forced change invalidates that user's
-  existing cookies. A shadow entry with no usable password (empty, `!`, `*`,
-  `x`) is denied by default (`ALLOW_NOPASSWD=1` overrides). A missing shadow
-  entry is denied. No cookie secret is written to disk; a hub restart invalidates
-  all sessions.
+  verified through PAM. The verifier tries, in order: the native
+  `node-linux-pam` module (root only), `su` on a pseudo-terminal through
+  `node-pty` (works on distributions that only let `su` read the password from a
+  terminal), and finally `su` with the password on stdin (works where `su` reads
+  stdin, e.g. Arch). `su` runs as `nobody`, so it asks for the target account's
+  password instead of letting root bypass the check. The cookie key is derived
+  from the account's shadow entry plus an in-process pepper, so a password
+  change, lock, or forced change invalidates that user's existing cookies. A
+  shadow entry with no usable password (empty, `!`, `*`, `x`) is denied by
+  default (`ALLOW_NOPASSWD=1` overrides). A missing shadow entry is denied. No
+  cookie secret is written to disk; a hub restart invalidates all sessions.
 - **Proxy**: the only accepted username is the account running the proxy; its
-  password is verified through PAM. The cookie key is an in-memory pepper, so a
-  proxy restart logs the browser out. The proxy does not read `/etc/shadow` and
-  does not detect a password change until the session expires or the proxy
-  restarts.
+  password is verified through the same PAM/`su` chain. The cookie key is an
+  in-memory pepper, so a proxy restart logs the browser out. The proxy does not
+  read `/etc/shadow` and does not detect a password change until the session
+  expires or the proxy restarts.
+
+`node-linux-pam` and `node-pty` are optional dependencies: `npm install` builds
+them when the toolchain is present. If your npm blocks install scripts, run
+`npm rebuild node-pty` (and `node-linux-pam` where libpam headers exist) so the
+tty-aware `su` path is available; otherwise the hub logs a warning at startup
+and uses the stdin fallback.
 
 Sessions are `HttpOnly; SameSite=Lax` cookies with `SESSION_TTL_MS` (default one
 day). Logout clears the browser cookie; there is no server-side session list or
