@@ -246,6 +246,26 @@ Sessions are `HttpOnly; SameSite=Lax` cookies with `SESSION_TTL_MS` (default one
 day). Logout clears the browser cookie; there is no server-side session list or
 per-session revocation. Account deletion is detected on the next request.
 
+### Session expiry response
+
+A request without a valid session is answered by kind:
+
+- a **document navigation** (`GET` with `Sec-Fetch-Dest: document|iframe`, or
+  `Accept: text/html`) gets `303 See Other` to `/hub/login`;
+- every other request (the SPA's fetches, API calls, static assets) gets `401`
+  with `{"error":"unauthenticated"}` and the header
+  `x-dsh-hub-login: /hub/login`, so a page-level watcher can navigate without
+  parsing an HTML login page.
+
+`GET /hub/api/session` answers
+`{"authenticated":true,"user":...,"expiresInSec":N}` for a live session (and is
+covered by the same 401 when it is not). The hub-only `dsh-hub-utils` plugin
+probes that endpoint on load and on tab activation, then keeps one timer at the
+reported deadline; at expiry it reloads the page, which the hub answers with the
+login redirect. No fetch wrapping or periodic polling is involved. The hub cannot
+force a top-level navigation from a fetch or WebSocket failure, which is why the
+redirect lives in the browser plugin rather than in the proxy.
+
 ### Login guard and audit log
 
 `/hub/login` counts failed attempts per client IP in a sliding window

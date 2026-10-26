@@ -9,7 +9,7 @@ import {
 } from '../backend/dsh-proxy.mjs';
 import {
   handleKeepAlive, localeFromRequest, loginPage, pageHeaders, readRequestBody, sendHtml,
-  startingPage, t,
+  sendJson, startingPage, t, wantsDocument,
 } from '../backend/web.mjs';
 import { keyFor, lookupUser, verify } from './accounts.mjs';
 import { backends, getOrCreateBackend } from './instances.mjs';
@@ -19,7 +19,7 @@ import {
   sessionListCacheKey, storeSessionList,
 } from './session-list-cache.mjs';
 
-const { handleLogin, handleLogout, sessionUser } = createLogin({
+const { handleLogin, handleLogout, sessionInfo, sessionUser } = createLogin({
   verify, keyFor, auditPath: AUTH_LOG_FILE, cfg: CFG,
 });
 
@@ -59,14 +59,29 @@ export async function route(req, res) {
     return;
   }
 
-  const user = sessionUser(req);
-  if (!user) {
-    res.writeHead(303, { location: '/hub/login' });
-    res.end();
+  const session = sessionInfo(req);
+  if (session === null) {
+    // A navigation goes to the login page; a fetch gets a machine-readable 401
+    // so a hub-aware page can redirect without depending on dsh's UI.
+    if (wantsDocument(req)) {
+      res.writeHead(303, { location: '/hub/login' });
+      res.end();
+    } else {
+      sendJson(res, 401, { error: 'unauthenticated' }, { 'x-dsh-hub-login': '/hub/login' });
+    }
     return;
   }
+  const user = session.user;
   if (!lookupUser(user)) {  // account deleted since login
     handleLogout(req, res);
+    return;
+  }
+  if (url.pathname === '/hub/api/session') {
+    sendJson(res, 200, {
+      authenticated: true,
+      user,
+      expiresInSec: Math.max(0, Math.floor((session.exp - Date.now()) / 1000)),
+    });
     return;
   }
   if (url.pathname === '/hub/api/keepalive') {

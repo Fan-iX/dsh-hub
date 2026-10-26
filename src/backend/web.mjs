@@ -147,14 +147,29 @@ export function sendHtml(res, status, body, headers = {}) {
 }
 
 /** Write one JSON response. */
-export function sendJson(res, status, value) {
+export function sendJson(res, status, value, headers = {}) {
   const body = JSON.stringify(value);
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(body),
     'cache-control': 'no-store',
+    ...headers,
   });
   res.end(body);
+}
+
+/**
+ * Whether a request asks for a top-level document. A missing session redirects
+ * such a request to the login page; fetch/API calls get a machine-readable 401
+ * instead, so a page-level watcher can navigate without parsing HTML.
+ * @param req - the incoming request.
+ * @returns true for a GET navigation or iframe request.
+ */
+export function wantsDocument(req) {
+  if (req.method !== 'GET') return false;
+  const dest = String(req.headers['sec-fetch-dest'] ?? '');
+  if (dest === 'document' || dest === 'iframe') return true;
+  return /text\/html/i.test(String(req.headers.accept ?? ''));
 }
 
 /** Read a request body as UTF-8 text, rejecting anything over `limit` bytes. */

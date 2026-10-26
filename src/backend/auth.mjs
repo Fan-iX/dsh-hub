@@ -428,8 +428,8 @@ export function createLogin({ verify, keyFor, auditPath, cfg }) {
     return null;
   }
 
-  /** The authenticated username from the session cookie, or null. */
-  function sessionUser(req) {
+  /** The authenticated session (user and signed expiry), or null. */
+  function sessionInfo(req) {
     const val = parseCookie(req);
     if (!val) return null;
     const m = /^(.+)\.(\d+)\.(.+)$/.exec(val);
@@ -442,7 +442,13 @@ export function createLogin({ verify, keyFor, auditPath, cfg }) {
     const expect = sign(user, exp, key);
     const a = Buffer.from(sig), b = Buffer.from(expect);
     if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
-    return user;
+    return { user, exp };
+  }
+
+  /** The authenticated username from the session cookie, or null. */
+  function sessionUser(req) {
+    const info = sessionInfo(req);
+    return info === null ? null : info.user;
   }
 
   function sendBlocked(res, locale, headers, ip, wait) {
@@ -518,5 +524,5 @@ export function createLogin({ verify, keyFor, auditPath, cfg }) {
     res.end();
   }
 
-  return { handleLogin, handleLogout, sessionUser };
+  return { handleLogin, handleLogout, sessionInfo, sessionUser };
 }
