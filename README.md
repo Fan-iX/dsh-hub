@@ -244,7 +244,23 @@ and logs a warning when neither is usable.
 
 Sessions are `HttpOnly; SameSite=Lax` cookies with `SESSION_TTL_MS` (default one
 day). Logout clears the browser cookie; there is no server-side session list or
-per-session revocation. Account deletion is detected on the next request.
+per-session revocation. Account deletion is picked up within the passwd-cache TTL
+(60 s); login and instance spawn force a fresh NSS read.
+
+### NSS lookups
+
+Account existence and the shadow fingerprint go through `getent`, which can block
+for seconds when a network backend (SSSD, LDAP, winbind) is unreachable. Both run
+as **async children** with a hard 3 s `SIGKILL` timeout and a per-user cache
+(single-flight; a stale entry is served while a background refresh runs), so a
+slow NSS backend delays only the request that needs the fresh answer — it never
+blocks the hub's event loop. A failed background shadow refresh keeps the cached
+key and retries after the fingerprint TTL instead of signing everyone out.
+
+A zombie child by itself does not block Node, but unreaped orphans can exhaust
+the PID table. If the hub runs in a container, start it under an init (`tini`, or
+`docker run --init` / `podman --init`) so NSS and `su` grandchildren are reaped;
+under systemd, PID 1 already does this.
 
 ### Session expiry response
 
