@@ -21,7 +21,7 @@ const SERVICE = CFG.serviceUser;
  */
 export async function verify(username, password) {
   if (username !== SERVICE) {
-    const decoy = decoyUser(CFG.authDecoyUser);
+    const decoy = await decoyUser(CFG.authDecoyUser);
     if (decoy !== null) {
       try { await pamAuthenticate(decoy, password); } catch { /* outcome ignored */ }
     }

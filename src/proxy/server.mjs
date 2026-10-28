@@ -96,7 +96,7 @@ export async function route(req, res) {
     return;
   }
   const user = session.user;
-  if (!lookupUser(user)) { // service account deleted since login
+  if (!await lookupUser(user)) { // service account deleted since login
     handleLogout(req, res);
     return;
   }

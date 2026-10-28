@@ -6,29 +6,85 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { promisify } from 'node:util';
 
 import { IS_ROOT } from './config.mjs';
 import {
   localeFromRequest, loginPage, pageHeaders, readBody, sendHtml, t, urlencoded,
 } from './web.mjs';
 
+const execFileAsync = promisify(execFile);
+
 // ------------------------------------------------------- system accounts ----
+//
+// NSS (`getent`) can block for seconds when a network backend (SSSD/LDAP/
+// winbind) is unreachable, so it must never run synchronously on the request
+// path. Every lookup is an async child with a hard SIGKILL timeout; Node reaps
+// the async child, and a hung query only delays the lookup that asked for it,
+// not the whole hub. Results are cached with a TTL and single-flight per user;
+// a stale entry is served while a refresh runs in the background.
 
-const passwdCache = new Map(); // user -> {uid, gid, home, shell} | null
+const NSS_OPTS = {
+  timeout: 3000,
+  killSignal: 'SIGKILL',
+  encoding: 'utf8',
+  maxBuffer: 1 << 20,
+};
+const PASSWD_TTL_MS = 60_000;
 
-/** Resolve one system account through NSS, cached per username. */
-export function lookupUser(user) {
-  if (!/^[a-z_][a-z0-9_-]{0,31}$/i.test(user)) return null;
-  if (passwdCache.has(user)) return passwdCache.get(user);
-  let info = null;
+const passwdCache = new Map(); // user -> { info, checkedAt }
+const passwdInflight = new Map(); // user -> Promise
+
+/**
+ * Run `getent` with a hard timeout.
+ * @returns stdout, or null when the lookup failed or timed out.
+ */
+export async function nssExec(args) {
   try {
-    const out = execFileSync('getent', ['passwd', user], { timeout: 3000 }).toString();
-    const [name, , uid, gid, , home, shell] = out.trim().split(':');
-    if (name === user) info = { uid: +uid, gid: +gid, home, shell };
-  } catch { /* unknown user */ }
-  passwdCache.set(user, info);
-  return info;
+    const { stdout } = await execFileAsync('getent', args, NSS_OPTS);
+    return stdout;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchPasswd(user) {
+  const out = await nssExec(['passwd', user]);
+  if (out === null) return null;
+  const [name, , uid, gid, , home, shell] = out.trim().split(':');
+  if (name !== user) return null;
+  return { uid: +uid, gid: +gid, home, shell };
+}
+
+function refreshPasswd(user) {
+  const inflight = passwdInflight.get(user);
+  if (inflight !== undefined) return inflight;
+  const run = fetchPasswd(user)
+    .then((info) => {
+      passwdCache.set(user, { info, checkedAt: Date.now() });
+      return info;
+    })
+    .finally(() => { passwdInflight.delete(user); });
+  passwdInflight.set(user, run);
+  return run;
+}
+
+/**
+ * Resolve one system account through NSS.
+ * @param user - account name.
+ * @param force - await a fresh read (login/spawn); otherwise a cached answer is
+ *   returned and a stale one is refreshed in the background.
+ * @returns the account info, or null when it does not exist.
+ */
+export async function lookupUser(user, force = false) {
+  if (!/^[a-z_][a-z0-9_-]{0,31}$/i.test(user)) return null;
+  const cached = passwdCache.get(user);
+  if (cached !== undefined && !force) {
+    if (Date.now() - cached.checkedAt >= PASSWD_TTL_MS) void refreshPasswd(user);
+    return cached.info;
+  }
+  return refreshPasswd(user);
 }
 
 // ----------------------------------------------------------------- PAM ------
@@ -195,10 +251,10 @@ function suViaStdin(username, password) {
 // ignored and the login always fails. A locked system account works as a decoy.
 let decoyName; // undefined = not resolved yet, null = unavailable
 /** Resolve (once) the account used to equalize unknown-username timing. */
-export function decoyUser(name) {
+export async function decoyUser(name) {
   if (decoyName !== undefined) return decoyName;
   const candidate = name;
-  decoyName = candidate && lookupUser(candidate) ? candidate : null;
+  decoyName = candidate && await lookupUser(candidate, true) ? candidate : null;
   if (decoyName === null) {
     console.warn(`[hub] AUTH_DECOY_USER=${JSON.stringify(candidate)} is not an existing account; `
       + 'unknown-usernames are answered faster than wrong passwords');

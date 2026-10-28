@@ -15,7 +15,7 @@ import { lookupUser } from './auth.mjs';
 import { createProxyServer } from './server.mjs';
 import { startCuller } from '../backend/instance.mjs';
 
-if (!lookupUser(CFG.serviceUser)) {
+if (!await lookupUser(CFG.serviceUser, true)) {
   console.error(`[hub] FATAL: service account ${JSON.stringify(CFG.serviceUser)} does not exist`);
   process.exit(1);
 }

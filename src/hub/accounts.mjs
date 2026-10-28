@@ -3,10 +3,9 @@
 // shadow entry.
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import { execFileSync } from 'node:child_process';
 
 import { CFG } from './config.mjs';
-import { decoyUser, lookupUser, pamAuthenticate } from '../backend/auth.mjs';
+import { decoyUser, lookupUser, nssExec, pamAuthenticate } from '../backend/auth.mjs';
 
 export { lookupUser };
 
@@ -39,18 +38,10 @@ function hasUsablePassword(hash) {
  * on lock, expiry, or a forced change. No shadow file is parsed directly.
  * @returns `{ line, hasPassword }`, or null when no shadow entry is available.
  */
-function readShadow(user) {
+async function readShadow(user) {
   if (!/^[a-z_][a-z0-9_-]{0,31}$/i.test(user)) return null;
-  let out;
-  try {
-    out = execFileSync('getent', ['shadow', user], {
-      timeout: 3000,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-  } catch {
-    return null;
-  }
+  const out = await nssExec(['shadow', user]);
+  if (out === null) return null;
   const line = out.split('\n').find((row) => row.startsWith(`${user}:`));
   if (line === undefined) return null;
   const fields = line.split(':');
@@ -67,30 +58,8 @@ function shadowMtime() {
   }
 }
 
-/**
- * The cached per-user key. The cache stores only the derived key (never the
- * shadow line) and is bounded. A cookie for a user with no cache entry is
- * rejected without an NSS call, so forged cookies cannot force `getent` runs.
- * @param force - refresh even when the cached entry is fresh (used at login).
- * @returns the entry, or null when the user has no shadow entry.
- */
-function credentialFor(user, force = false) {
-  const now = Date.now();
-  const cached = USERS.get(user);
-  if (!force && cached !== undefined) {
-    const fresh = now - cached.checkedAt < CFG.fingerprintTtlMs && shadowMtime() <= cached.mtime;
-    if (fresh) {
-      cached.lastUsed = now;
-      USERS.delete(user);
-      USERS.set(user, cached);
-      return cached;
-    }
-  }
-  const shadow = readShadow(user);
-  if (shadow === null) {
-    USERS.delete(user);
-    return null;
-  }
+/** Store one freshly read shadow fingerprint as the user's key. */
+function storeCredential(user, shadow, now) {
   const key = crypto.createHmac('sha256', PEPPER).update(`${user}\0${shadow.line}`).digest();
   const entry = {
     key,
@@ -108,6 +77,55 @@ function credentialFor(user, force = false) {
   return entry;
 }
 
+/**
+ * Refresh one user's credential from NSS. Async so a slow `getent shadow`
+ * cannot block the event loop.
+ * @param keepExisting - on a failed read, keep the cached entry (and age it) so
+ *   a transient NSS outage does not sign the user out.
+ */
+async function refreshCredential(user, keepExisting) {
+  const shadow = await readShadow(user);
+  if (shadow === null) {
+    if (keepExisting) {
+      const cached = USERS.get(user);
+      if (cached !== undefined) cached.checkedAt = Date.now();
+    } else {
+      USERS.delete(user);
+    }
+    return null;
+  }
+  return storeCredential(user, shadow, Date.now());
+}
+
+const refreshing = new Set();
+
+function scheduleRefresh(user) {
+  if (refreshing.has(user)) return;
+  refreshing.add(user);
+  void refreshCredential(user, true)
+    .catch((err) => console.error(`[hub] shadow refresh failed for ${user}:`, err.message))
+    .finally(() => refreshing.delete(user));
+}
+
+/**
+ * The cached key for a request. The cache stores only the derived key (never
+ * the shadow line) and is bounded. A stale entry is returned while a background
+ * refresh runs; a cookie for a user with no entry is rejected without an NSS
+ * call, so forged cookies cannot force `getent` runs.
+ * @returns the entry, or null when the user has no cached key.
+ */
+function cachedCredential(user) {
+  const now = Date.now();
+  const cached = USERS.get(user);
+  if (cached === undefined) return null;
+  const fresh = now - cached.checkedAt < CFG.fingerprintTtlMs && shadowMtime() <= cached.mtime;
+  if (!fresh) scheduleRefresh(user);
+  cached.lastUsed = now;
+  USERS.delete(user);
+  USERS.set(user, cached);
+  return cached;
+}
+
 setInterval(() => {
   const cutoff = Date.now() - CFG.sessionTtlMs - CFG.fingerprintTtlMs;
   for (const [user, entry] of USERS) {
@@ -122,17 +140,17 @@ setInterval(() => {
  * @returns `{ ok, reason }`; the shared login flow audits the reason.
  */
 export async function verify(username, password) {
-  if (!lookupUser(username)) {
+  if (!await lookupUser(username, true)) {
     // Count the probe against the window and equalize timing with a real PAM
     // check against a decoy account. The outcome is ignored.
-    const decoy = decoyUser(CFG.authDecoyUser);
+    const decoy = await decoyUser(CFG.authDecoyUser);
     if (decoy !== null) {
       try { await pamAuthenticate(decoy, password); } catch { /* outcome ignored */ }
     }
     return { ok: false, reason: 'unknown-user' };
   }
   if (!await pamAuthenticate(username, password)) return { ok: false, reason: 'auth-failed' };
-  const credential = credentialFor(username, true);
+  const credential = await refreshCredential(username, false);
   if (credential === null) return { ok: false, reason: 'shadow-unavailable' };
   if (!credential.hasPassword && !CFG.allowNoPassword) return { ok: false, reason: 'no-password' };
   if (CFG.allowUsers.length && !CFG.allowUsers.includes(username)) {
@@ -144,11 +162,12 @@ export async function verify(username, password) {
 /**
  * The cookie key for `user`, or null when no session may be issued or kept.
  * With `force = false` a user that has not logged in since this process started
- * (no cache entry) is rejected without an NSS call.
+ * (no cache entry) is rejected without an NSS call. A stale entry is used while
+ * a refresh runs in the background.
  */
 export function keyFor(user, force = false) {
-  if (!force && !USERS.has(user)) return null;
-  const credential = credentialFor(user, force);
+  if (!USERS.has(user)) return null;
+  const credential = force ? USERS.get(user) : cachedCredential(user);
   if (credential === null) return null;
   if (!credential.hasPassword && !CFG.allowNoPassword) return null;
   return credential.key;

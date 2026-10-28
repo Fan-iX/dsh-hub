@@ -62,7 +62,7 @@ export async function getOrCreateBackend(user) {
   if (be?.starting) return be.start();
   if (be && be.child && be.child.exitCode === null) return be;
 
-  const info = lookupUser(user);
+  const info = await lookupUser(user, true);
   if (!info) throw new Error(`unknown system user: ${user}`);
   if (CFG.allowUsers.length && !CFG.allowUsers.includes(user)) {
     throw new Error(`user ${user} is not on the allow-list`);
