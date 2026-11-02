@@ -142,12 +142,14 @@ export function pageHeaders(req, locale) {
 
 /** Write a small HTML response. */
 export function sendHtml(res, status, body, headers = {}) {
+  if (res.destroyed || res.writableEnded) return;
   res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', ...headers });
   res.end(body);
 }
 
 /** Write one JSON response. */
 export function sendJson(res, status, value, headers = {}) {
+  if (res.destroyed || res.writableEnded) return;
   const body = JSON.stringify(value);
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
@@ -172,18 +174,64 @@ export function wantsDocument(req) {
   return /text\/html/i.test(String(req.headers.accept ?? ''));
 }
 
-/** Read a request body as UTF-8 text, rejecting anything over `limit` bytes. */
-export function readBody(req, limit = 64 * 1024) {
+/** Default deadline for one hub-owned request body. */
+const BODY_TIMEOUT_MS = 10_000;
+/** Cap for a hub-owned JSON RPC body; the session.list payload is a few hundred bytes. */
+const RPC_BODY_LIMIT = 1 * 1024 * 1024;
+
+/**
+ * Read a request body with a byte cap, a hard deadline, and client-abort
+ * handling. A slow or vanished client must never leave a pending promise (or an
+ * unbounded buffer) behind; the timeout destroys the request.
+ */
+function readStream(req, { limit, timeoutMs, encoding }) {
   return new Promise((resolve, reject) => {
-    let size = 0; const chunks = [];
-    req.on('data', (c) => {
-      size += c.length;
-      if (size > limit) { reject(new Error('body too large')); req.destroy(); return; }
-      chunks.push(c);
-    });
-    req.on('end', () => resolve(Buffer.concat(chunks).toString()));
-    req.on('error', reject);
+    let size = 0;
+    let settled = false;
+    let timer;
+    const chunks = [];
+    const cleanup = () => {
+      clearTimeout(timer);
+      req.removeListener('data', onData);
+      req.removeListener('end', onEnd);
+      req.removeListener('error', onError);
+      req.removeListener('aborted', onAbort);
+      req.removeListener('close', onClose);
+    };
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      fn(value);
+    };
+    const fail = (err) => {
+      finish(reject, err);
+      req.destroy();
+    };
+    const onData = (chunk) => {
+      size += chunk.length;
+      if (size > limit) { fail(new Error('body too large')); return; }
+      chunks.push(chunk);
+    };
+    const onEnd = () => {
+      const body = Buffer.concat(chunks);
+      finish(resolve, encoding === undefined ? body : body.toString(encoding));
+    };
+    const onError = (err) => finish(reject, err);
+    const onAbort = () => finish(reject, new Error('client aborted'));
+    const onClose = () => { if (!settled) finish(reject, new Error('client closed')); };
+    timer = setTimeout(() => fail(new Error('body timeout')), timeoutMs);
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.on('error', onError);
+    req.on('aborted', onAbort);
+    req.on('close', onClose);
   });
+}
+
+/** Read a request body as UTF-8 text (login/keepalive), capped and timed out. */
+export function readBody(req, limit = 64 * 1024) {
+  return readStream(req, { limit, timeoutMs: BODY_TIMEOUT_MS, encoding: 'utf8' });
 }
 
 /** Parse an `application/x-www-form-urlencoded` login body. */
@@ -192,14 +240,9 @@ export function urlencoded(body) {
   return { username: params.get('username') ?? '', password: params.get('password') ?? '' };
 }
 
-/** Read a request body as a Buffer, with no size cap. */
-export function readRequestBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    req.on('data', (c) => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
+/** Read a hub-owned RPC body as a Buffer, capped and timed out. */
+export function readRequestBody(req, limit = RPC_BODY_LIMIT) {
+  return readStream(req, { limit, timeoutMs: BODY_TIMEOUT_MS });
 }
 
 /** Copy headers for a hub-internal backend request, forcing a loopback Host. */

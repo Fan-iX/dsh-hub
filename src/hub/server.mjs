@@ -92,7 +92,13 @@ export async function route(req, res) {
   // Session-list RPC cache: serve the last known snapshot forever (serve-stale),
   // refresh it in the background on a throttle (see the cache module).
   if (req.method === 'POST' && url.pathname === SESSION_LIST_PATH) {
-    const body = await readRequestBody(req);
+    let body;
+    try {
+      body = await readRequestBody(req);
+    } catch (err) {
+      sendJson(res, err.message === 'body too large' ? 413 : 408, { error: err.message }, { 'retry-after': '2' });
+      return;
+    }
     const key = sessionListCacheKey(user, body);
     const entry = rpcCache.get(key);
     const now = Date.now();
@@ -129,15 +135,22 @@ export async function route(req, res) {
     const internalCookie = await hubDshCookieHeader(be);
     if (internalCookie) req.headers.cookie = internalCookie;
     let captured;
+    // The browser's session.list request and the hub's internal forward are
+    // independent; abort the forward when the client goes away so a slow store
+    // does not keep working (and holding a 12 MB response) for nobody.
+    const abort = new AbortController();
+    const onClientClose = () => { if (!res.writableEnded) abort.abort(); };
+    res.once('close', onClientClose);
     try {
-      captured = await forwardSessionList(be, req.headers, body);
+      captured = await forwardSessionList(be, req.headers, body, abort.signal);
     } catch (err) {
-      // Backend died between spawn and forward (cull/restart race): fall back
-      // to the streaming proxy, which re-triggers the spawn-on-demand path.
+      // The request body is already consumed, so the generic proxy fallback
+      // would forward an empty RPC; answer a retryable failure instead.
       console.error(`[hub] session.list forward failed for ${user}:`, err.message);
-      req.hubBackend = be; // lets the proxy error handler classify a startup race
-      proxy.web(req, res, { target: `http://127.0.0.1:${be.port}` });
+      sendJson(res, 503, { error: 'session list unavailable' }, { 'retry-after': '5' });
       return;
+    } finally {
+      res.removeListener('close', onClientClose);
     }
     if (isCacheableSessionList(captured)) storeSessionList(key, captured);
     if (res.destroyed || res.writableEnded) return;
@@ -204,12 +217,19 @@ export async function route(req, res) {
  */
 export function createHubServer() {
   const server = http.createServer((req, res) => {
+    // Client resets are normal on flaky networks; never let them surface as an
+    // unhandled socket error. The route's promise settles separately.
+    req.on('error', () => { /* client gone */ });
+    res.on('error', () => { /* client gone */ });
     route(req, res).catch((err) => {
       console.error('[hub] handler error:', err);
+      if (res.destroyed || res.writableEnded) return;
       if (!res.headersSent) res.writeHead(500);
       res.end('dsh-hub: internal error');
     });
   });
+  // Bound slow headers (slowloris); request bodies carry their own deadline.
+  server.headersTimeout = 30_000;
 
   // WebSocket upgrade (dsh event streams) — routed by the same session cookie.
   server.on('upgrade', (req, socket, head) => {
@@ -232,15 +252,27 @@ export function createHubServer() {
     // heartbeats the stream every 2s and the client answers, so `data` keeps
     // arriving; the count alone is the stronger guard.
     be.wsClients += 1;
-    socket.on('data', () => be.touch());
-    socket.on('close', () => {
+    let detached = false;
+    const detach = () => {
+      if (detached) return;
+      detached = true;
       be.wsClients = Math.max(0, be.wsClients - 1);
       be.touch(); // the idle window starts when the stream detaches
-    });
+    };
+    socket.on('data', () => be.touch());
+    socket.on('close', detach);
+    // A reset before the upstream upgrade would otherwise be an unhandled
+    // 'error' on the raw socket.
+    socket.on('error', () => { detach(); socket.destroy(); });
     if (TRUST_MODE === 'origin-rewrite') {
       req.headers.origin = `http://127.0.0.1:${be.port}`;
     }
-    proxy.ws(req, socket, head, { target: `http://127.0.0.1:${be.port}` });
+    try {
+      proxy.ws(req, socket, head, { target: `http://127.0.0.1:${be.port}` });
+    } catch {
+      detach();
+      socket.destroy();
+    }
   });
 
   return server;

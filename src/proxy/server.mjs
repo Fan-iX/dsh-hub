@@ -160,12 +160,19 @@ export async function route(req, res) {
  */
 export function createProxyServer() {
   const server = http.createServer((req, res) => {
+    // Client resets are normal on flaky networks; never let them surface as an
+    // unhandled socket error. The route's promise settles separately.
+    req.on('error', () => { /* client gone */ });
+    res.on('error', () => { /* client gone */ });
     route(req, res).catch((err) => {
       console.error('[hub] handler error:', err);
+      if (res.destroyed || res.writableEnded) return;
       if (!res.headersSent) res.writeHead(500);
       res.end('dsh-hub: internal error');
     });
   });
+  // Bound slow headers (slowloris); request bodies carry their own deadline.
+  server.headersTimeout = 30_000;
 
   server.on('upgrade', (req, socket, head) => {
     const user = sessionUser(req);
@@ -182,15 +189,27 @@ export function createProxyServer() {
     }
     be.touch();
     be.wsClients += 1;
-    socket.on('data', () => be.touch());
-    socket.on('close', () => {
+    let detached = false;
+    const detach = () => {
+      if (detached) return;
+      detached = true;
       be.wsClients = Math.max(0, be.wsClients - 1);
       be.touch();
-    });
+    };
+    socket.on('data', () => be.touch());
+    socket.on('close', detach);
+    // A reset before the upstream upgrade would otherwise be an unhandled
+    // 'error' on the raw socket.
+    socket.on('error', () => { detach(); socket.destroy(); });
     if (TRUST_MODE === 'origin-rewrite') {
       req.headers.origin = `http://127.0.0.1:${be.port}`;
     }
-    proxy.ws(req, socket, head, { target: `http://127.0.0.1:${be.port}` });
+    try {
+      proxy.ws(req, socket, head, { target: `http://127.0.0.1:${be.port}` });
+    } catch {
+      detach();
+      socket.destroy();
+    }
   });
 
   return { server, getInstance: () => instance };

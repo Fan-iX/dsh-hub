@@ -28,6 +28,7 @@ import { sanitizeForwardHeaders } from '../backend/web.mjs';
 export const SESSION_LIST_PATH = '/api/session/list';
 const RPC_CACHE_REVALIDATE_MS = 60_000;   // min gap between background refreshes (12MB responses; keep the hub event loop free)
 const RPC_CACHE_FAIL_BACKOFF_MS = 30_000; // pause after a failed refresh
+const SESSION_LIST_TIMEOUT_MS = 120_000;  // a cold store can take 40-66s; never let a forward hang forever
 export const rpcCache = new Map(); // key -> { status, headers, body, nextRevalidateAt, inflight }
 const RPC_CACHE_MAX = 500;
 const prewarmInflight = new Set();
@@ -110,8 +111,21 @@ export function loadPersistedCache() {
   if (rpcCache.size > 0) console.log(`[hub] loaded ${rpcCache.size} persisted session.list cache entries`);
 }
 
-export function forwardSessionList(be, headers, body) {
+export function forwardSessionList(be, headers, body, signal) {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer;
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+    };
+    const done = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      fn(value);
+    };
+    const onAbort = () => { req.destroy(new Error('session.list aborted')); };
     const req = http.request({
       host: '127.0.0.1',
       port: be.port,
@@ -121,9 +135,15 @@ export function forwardSessionList(be, headers, body) {
     }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
-      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
+      res.on('end', () => done(resolve, { status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
+      res.on('error', (err) => done(reject, err));
     });
-    req.on('error', reject);
+    req.on('error', (err) => done(reject, err));
+    timer = setTimeout(() => { req.destroy(new Error('session.list timed out')); }, SESSION_LIST_TIMEOUT_MS);
+    if (signal !== undefined) {
+      if (signal.aborted) { onAbort(); return; }
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
     req.end(body);
   });
 }
@@ -138,17 +158,34 @@ export function requestRpcId(body) {
   }
 }
 
-/** Republish a cached server-response under the caller's rpcId; the client rejects a mismatched echo. */
+/**
+ * Republish a cached server-response under the caller's rpcId (the client
+ * rejects a mismatched echo). This runs on every cache hit with bodies up to
+ * ~12 MB, so splice the first top-level `"rpcId"` value in the buffer instead of
+ * JSON.parse + JSON.stringify over the whole payload, which blocks the event
+ * loop long enough to stall the WebSocket event streams.
+ */
 function withRpcId(body, rpcId) {
   if (rpcId === undefined) return body;
-  try {
-    const parsed = JSON.parse(body.toString('utf8'));
-    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return body;
-    parsed.rpcId = rpcId;
-    return Buffer.from(JSON.stringify(parsed));
-  } catch {
-    return body;
+  const key = body.indexOf('"rpcId"');
+  if (key === -1) return body;
+  const colon = body.indexOf(':', key + 7);
+  if (colon === -1) return body;
+  let start = colon + 1;
+  while (start < body.length && (body[start] === 0x20 || body[start] === 0x09
+    || body[start] === 0x0a || body[start] === 0x0d)) start++;
+  if (body[start] !== 0x22) return body;
+  let end = start + 1;
+  for (; end < body.length; end++) {
+    if (body[end] === 0x5c) { end++; continue; } // skip the escaped byte
+    if (body[end] === 0x22) break;
   }
+  if (end >= body.length) return body;
+  return Buffer.concat([
+    body.subarray(0, start),
+    Buffer.from(JSON.stringify(rpcId)),
+    body.subarray(end + 1),
+  ]);
 }
 
 export function serveCachedSessionList(res, entry, rpcId) {

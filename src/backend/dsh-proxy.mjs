@@ -89,17 +89,21 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
     proxyRes.resume(); // discard dsh's 401 body; this handler owns the response
     bridgeDshBrowserSession(req, res, be, { force: true })
       .then((handled) => {
-        if (handled || res.headersSent || res.writableEnded) return;
+        if (handled || res.headersSent || res.writableEnded || res.destroyed) return;
         res.writeHead(401, { 'cache-control': 'no-store', 'content-type': 'text/plain; charset=utf-8' });
         res.end('dsh web authentication required; reopen the URL printed by dsh web.\n');
       })
       .catch((err) => {
         console.error('[hub] browser-session bridge failed:', err.message);
-        if (!res.headersSent) { res.writeHead(502); res.end('dsh-hub: browser-session bridge failed\n'); }
+        if (!res.headersSent && !res.destroyed && !res.writableEnded) {
+          res.writeHead(502);
+          res.end('dsh-hub: browser-session bridge failed\n');
+        }
       });
     return;
   }
   if (!/text\/html/i.test(ct)) {
+    if (res.destroyed || res.writableEnded) { proxyRes.resume(); return; }
     res.writeHead(proxyRes.statusCode, proxyRes.headers);
     proxyRes.pipe(res);
     return;
@@ -108,6 +112,7 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
   proxyRes.on('data', (c) => chunks.push(c));
   proxyRes.on('error', () => res.destroy());
   proxyRes.on('end', () => {
+    if (res.destroyed || res.writableEnded) return;
     const headers = { ...proxyRes.headers };
     delete headers['content-length'];
     delete headers['content-encoding'];
@@ -237,6 +242,7 @@ export async function bridgeDshBrowserSession(req, res, be, { force = false } = 
   if (!await be.waitLaunchToken(5000)) return false;
   const setCookie = await mintDshSessionCookie(be, authority);
   if (!setCookie) return false;
+  if (res.destroyed || res.writableEnded) return false;
   res.writeHead(303, {
     'cache-control': 'no-store',
     'referrer-policy': 'no-referrer',
