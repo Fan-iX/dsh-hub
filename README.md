@@ -262,6 +262,28 @@ the PID table. If the hub runs in a container, start it under an init (`tini`, o
 `docker run --init` / `podman --init`) so NSS and `su` grandchildren are reaped;
 under systemd, PID 1 already does this.
 
+### Slow or vanished clients
+
+A stalled or disconnected browser must not pin the hub or leak a request:
+
+- Login/keep-alive bodies are capped (64 KB / 1 KB) and every hub-owned body has
+  a 10 s deadline; a client abort settles the read immediately. `session.list`
+  RPC bodies are capped at 1 MB.
+- A `session.list` forward is bounded (120 s) and is aborted when the browser's
+  connection closes, so a dead client cannot keep a slow store (or a 12 MB
+  response) busy. On failure the hub answers `503` with `retry-after`; the
+  request body is already consumed, so it must not fall through to the generic
+  proxy. Cache hits rewrite `rpcId` by splicing the buffer instead of parsing and
+  re-serializing the whole response.
+- Client socket/request/response errors are handled at the server boundary;
+  WebSocket upgrades detach their client count on error and never leave an
+  unhandled socket error. `headersTimeout` is 30 s to bound slowloris.
+- iptables guard calls are async with a 5 s `SIGKILL` timeout, so a stuck
+  `xtables` lock delays one spawn (or its cleanup), not the whole hub.
+
+Proxied dsh uploads/downloads keep Node's default `requestTimeout` (300 s); the
+hub's own 10 s deadline applies only to the small bodies it parses itself.
+
 ### Session expiry response
 
 A request without a valid session is answered by kind:
