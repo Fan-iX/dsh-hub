@@ -2,7 +2,8 @@
 // uid/gid isolation, loopback owner guards, per-user logs, and the idle culler.
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 
 import { CFG, IPTABLES, IS_ROOT, TRUSTED_HOSTS, TRUST_MODE } from './config.mjs';
 import { lookupUser } from '../backend/auth.mjs';
@@ -10,42 +11,45 @@ import { DshInstance, startCuller } from '../backend/instance.mjs';
 import { webConfigPatches } from './web-config.mjs';
 import { prewarmSessionList } from './session-list-cache.mjs';
 
+const execFileAsync = promisify(execFile);
+
 /** @type {Map<string, DshInstance>} */
 export const backends = new Map();
 
 // iptables loopback owner-guard: only the backend's own uid (and root) may
 // connect to the backend port on lo. Other local users get DROPped. This closes
 // the "dsh has no auth and loopback is shared" hole on multi-user machines.
-function addGuard(port, uid) {
+//
+// Async with a hard SIGKILL timeout: iptables can block on the xtables lock for
+// seconds, and a sync call here froze the whole hub (including the event streams
+// it proxies) on every spawn and instance exit.
+async function addGuard(port, uid) {
   if (!IPTABLES) return;
   // Insert in reverse so final order is: ACCEPT(root), ACCEPT(uid), DROP.
-  runIptables(['-I', 'OUTPUT', '1', '-o', 'lo', '-p', 'tcp', '--dport', String(port),
+  await runIptables(['-I', 'OUTPUT', '1', '-o', 'lo', '-p', 'tcp', '--dport', String(port),
     '-j', 'DROP']);
-  runIptables(['-I', 'OUTPUT', '1', '-o', 'lo', '-p', 'tcp', '--dport', String(port),
+  await runIptables(['-I', 'OUTPUT', '1', '-o', 'lo', '-p', 'tcp', '--dport', String(port),
     '-m', 'owner', '--uid-owner', String(uid), '-j', 'ACCEPT']);
-  runIptables(['-I', 'OUTPUT', '1', '-o', 'lo', '-p', 'tcp', '--dport', String(port),
+  await runIptables(['-I', 'OUTPUT', '1', '-o', 'lo', '-p', 'tcp', '--dport', String(port),
     '-m', 'owner', '--uid-owner', '0', '-j', 'ACCEPT']);
 }
 
 /** Remove the loopback owner guard for one closed backend. */
-export function removeGuard(port, uid) {
+export async function removeGuard(port, uid) {
   if (!IPTABLES) return;
   for (const args of [
     ['-o', 'lo', '-p', 'tcp', '--dport', String(port), '-m', 'owner', '--uid-owner', '0', '-j', 'ACCEPT'],
     ['-o', 'lo', '-p', 'tcp', '--dport', String(port), '-m', 'owner', '--uid-owner', String(uid), '-j', 'ACCEPT'],
     ['-o', 'lo', '-p', 'tcp', '--dport', String(port), '-j', 'DROP'],
   ]) {
-    try {
-      const bin = fs.existsSync('/usr/sbin/iptables') ? '/usr/sbin/iptables' : '/usr/bin/iptables';
-      execFileSync(bin, ['-D', 'OUTPUT', ...args], { stdio: 'ignore', timeout: 5000 });
-    } catch { /* already gone */ }
+    await runIptables(['-D', 'OUTPUT', ...args], true);
   }
 }
 
-function runIptables(args, tolerate = false) {
-  const bin = '/usr/sbin/iptables';
+async function runIptables(args, tolerate = false) {
+  const bin = fs.existsSync('/usr/sbin/iptables') ? '/usr/sbin/iptables' : '/usr/bin/iptables';
   try {
-    execFileSync(fs.existsSync(bin) ? bin : '/usr/bin/iptables', args, { stdio: 'ignore', timeout: 5000 });
+    await execFileAsync(bin, args, { timeout: 5000, killSignal: 'SIGKILL', maxBuffer: 64 * 1024 });
   } catch (err) {
     if (!tolerate) console.error('[hub] iptables failed:', args.join(' '), err.message);
   }
@@ -105,7 +109,7 @@ export async function getOrCreateBackend(user) {
     spawnTimeoutMs: CFG.spawnTimeoutMs,
     onSpawn: (be) => addGuard(be.port, info.uid),
     onExit: (be) => {
-      removeGuard(be.port, info.uid);
+      void removeGuard(be.port, info.uid);
       if (backends.get(user) === be) backends.delete(user);
     },
   });

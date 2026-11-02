@@ -155,7 +155,7 @@ export class DshInstance {
     console.log(`[hub] spawning dsh for ${this.user} on 127.0.0.1:${this.port}`);
     const child = spawn(process.execPath, args, spawnOpts);
     this.child = child;
-    this.onSpawn?.(this);
+    await this.onSpawn?.(this);
     this.log = openLog(this.opts.logPath);
     this.#attachOutput(child);
     child.once('error', (err) => {

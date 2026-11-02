@@ -13,7 +13,7 @@ let shuttingDown = false;
 function forceKillBackends() {
   for (const be of backends.values()) {
     be.kill('SIGKILL');
-    removeGuard(be.port, be.info.uid);
+    void removeGuard(be.port, be.info.uid);
   }
 }
 
