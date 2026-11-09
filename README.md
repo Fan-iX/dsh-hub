@@ -77,12 +77,13 @@ sudo service dsh-hub start
 ```
 
 The installed units start the hub as root from `/`; it keeps no writable state
-in its working directory. The session-list cache is memory-only by default; set
+in its working directory. The session-list cache is memory-only by default
+(256 MiB / 32 MiB per entry, 4 h TTL); set
 `CACHE_DIRECTORY=/var/cache/dsh-hub` (or enable `CacheDirectory=dsh-hub` in the
-unit) to persist it. `HUB_LOG_DIR` is created by the hub at startup. The units
-accept the [configuration](#configuration) environment variables; the defaults
-(`HUB_PORT=3080`, `HUB_LOG_DIR=/var/log/dsh-hub`) apply unless overridden in
-`/etc/conf.d/dsh-hub` (OpenRC) or `/etc/default/dsh-hub` /
+unit) to add the per-user disk tier. `HUB_LOG_DIR` is created by the hub at
+startup. The units accept the [configuration](#configuration) environment
+variables; the defaults (`HUB_PORT=3080`, `HUB_LOG_DIR=/var/log/dsh-hub`) apply
+unless overridden in `/etc/conf.d/dsh-hub` (OpenRC) or `/etc/default/dsh-hub` /
 `/etc/sysconfig/dsh-hub` (sysvinit). Those files also honour `DSH_HUB_DIR`,
 `DSH_HUB_PIDFILE` and `NODE_BINARY`. `openrc-run` and sysvinit pass on
 **exported** variables only:
@@ -151,8 +152,10 @@ with it.
 |---|---|---|
 | `HUB_LOG_DIR` | `/var/log/dsh-hub` | per-user dsh logs; also the default audit-log directory |
 | `HUB_AUTH_LOG` | `<HUB_LOG_DIR>/auth.log` | append-only authentication audit log (`0600`) |
-| `CACHE_DIRECTORY` | *(unset: memory-only)* | persistent session-list cache root; systemd `CacheDirectory=dsh-hub` sets it to `/var/cache/dsh-hub` |
-| `HUB_CLEAN_ON_STOP` | `1` | on stop, delete the persisted cache (only when `CACHE_DIRECTORY` is set); `0` keeps it |
+| `CACHE_DIRECTORY` | *(unset: memory-only)* | persistent session-list cache root; systemd `CacheDirectory=dsh-hub` sets it to `/var/cache/dsh-hub`; one `<user>.cache` file per user |
+| `CACHE_MEM_TTL_MS` | `14400000` (4 h) | hot memory entry TTL, measured from the last content change (rpcId excluded); independent of `IDLE_CULL_MS` |
+| `CACHE_MEMORY_MAX_BYTES` | `268435456` (256 MiB) | global memory cache cap; least-recently-used entries are evicted |
+| `CACHE_ENTRY_MAX_BYTES` | `33554432` (32 MiB) | single-entry memory cap; larger responses come from the disk tier when `CACHE_DIRECTORY` is set, otherwise they are not cached |
 | `HUB_WEB_CONFIG_DIR` | `/etc/dsh-hub/web_config.d` | `*.yml` drop-ins applied as `--patch` to spawned instances, in file-name order |
 | `ALLOW_USERS` | *(all)* | comma-separated username allow-list |
 | `ALLOW_NOPASSWD` | `0` | allow an account whose shadow entry has no usable password to receive a session |
@@ -354,9 +357,10 @@ fall back to stdout/journald.
   redacted. The hub uses `<HUB_LOG_DIR>/<user>.log`; the proxy uses
   `<HUB_LOG_DIR>/dsh.log`.
 - On `SIGTERM`/`SIGINT`/`SIGHUP` the whole dsh process group is stopped
-  (`SIGTERM`, then `SIGKILL` after `SHUTDOWN_GRACE_MS`), the hub's loopback
-  guards are released, and the hub's persisted session-list cache is removed
-  unless `HUB_CLEAN_ON_STOP=0` (a memory-only cache has nothing to remove).
+  (`SIGTERM`, then `SIGKILL` after `SHUTDOWN_GRACE_MS`) and the hub's loopback
+  guards are released. The persistent session-list cache is left in place; the
+  memory tier disappears with the process, and the administrator owns the disk
+  files' lifecycle.
 
 ### Keep-alive and quit
 
@@ -439,13 +443,31 @@ passes dsh's own 401 through.
 
 ### Session-list cache (hub)
 
-The hub serves a stale `/api/session/list` snapshot forever and refreshes it in
-the background on a throttle. The cache makes the sidebar instant even when
-dsh's projection is slow, and a cache hit never spawns an instance. It is
-**memory-only by default**; set `CACHE_DIRECTORY` (systemd:
-`CacheDirectory=dsh-hub` → `/var/cache/dsh-hub`) to persist it across restarts.
-Only 200 responses whose envelope carries an `items` array are cached, keyed by
-user plus request payload.
+The cache has two tiers:
+
+- **memory**: one entry per user for the standard
+  `this.remote.session.list({})` payload. It makes a browser page reconnect
+  instant without rebuilding the list. The entry expires
+  `CACHE_MEM_TTL_MS` after the last **content change** (the top-level rpcId is
+  excluded), independently of `IDLE_CULL_MS` and keep-alive. The global cap is
+  256 MiB, the per-entry cap is 32 MiB, and least-recently-used entries are
+  evicted. Culling an instance drops its memory entry.
+- **disk**: enabled only by `CACHE_DIRECTORY` (systemd
+  `CacheDirectory=dsh-hub` → `/var/cache/dsh-hub`). It holds one
+  `<user>.cache` file per user, loaded lazily when a session-list request needs
+  it while the instance is stopped or starting; that request is served without
+  spawning the backend.
+
+Only 200 responses carrying an `items` array are cached, and only for the
+standard payload; any other request is forwarded directly. The canonical body
+replaces the top-level rpcId value with `""` and records its span; serving writes
+prefix + caller rpcId + suffix, so there is no JSON parse/stringify and no
+full-body copy. The disk format is a small binary header plus the raw canonical
+body (no base64); the suffix is streamed from the file. The disk file is written
+only when that canonical body changes, and is never deleted by the hub on stop
+or startup: `/var/cache/dsh-hub` is the administrator's responsibility (for
+example a `tmpfiles.d` age rule). Missing or corrupt files are simply a cache
+miss.
 
 ## Global dsh overlays (hub)
 
@@ -522,8 +544,9 @@ Both modes keep dsh unmodified and on loopback; the front is the only listener.
   launches reuse the same data root and are faster.
 - The hub has no writable state in its working directory (`WorkingDirectory=/`
   under systemd). The session-list cache is memory-only by default; enabling
-  `CACHE_DIRECTORY` persists it under `/var/cache/dsh-hub`. The source tree can
-  stay read-only.
+  `CACHE_DIRECTORY` adds the per-user disk tier under `/var/cache/dsh-hub`,
+  whose lifecycle is managed by the administrator (the hub never deletes it on
+  stop). The source tree can stay read-only.
 - The hub's sessions are invalidated by a password change or lock because the
   cookie key follows the shadow entry; the proxy's sessions are not, because the
   proxy has no shadow access. Both are invalidated by a process restart.
