@@ -1,0 +1,7 @@
+# Active default overlay for the hub-managed dsh web UI.
+#
+# Hide the DeepSeek account sign-in button: on a LAN hostname the OAuth
+# callback origin check cannot pass, so the button cannot work. Delete this
+# row (or the whole file) to keep the button.
+- id: ui-settings-account
+  disabled: true

@@ -76,14 +76,16 @@ sudo chkconfig --add dsh-hub        # RHEL/CentOS
 sudo service dsh-hub start
 ```
 
-The installed units start the hub as root from `/var/lib/dsh-hub` — the working
-directory that holds the session cache — and accept the
-[configuration](#configuration) environment variables. The defaults
+The installed units start the hub as root from `/`; it keeps no writable state
+in its working directory. The session-list cache is memory-only by default; set
+`CACHE_DIRECTORY=/var/cache/dsh-hub` (or enable `CacheDirectory=dsh-hub` in the
+unit) to persist it. `HUB_LOG_DIR` is created by the hub at startup. The units
+accept the [configuration](#configuration) environment variables; the defaults
 (`HUB_PORT=3080`, `HUB_LOG_DIR=/var/log/dsh-hub`) apply unless overridden in
 `/etc/conf.d/dsh-hub` (OpenRC) or `/etc/default/dsh-hub` /
 `/etc/sysconfig/dsh-hub` (sysvinit). Those files also honour `DSH_HUB_DIR`,
-`DSH_HUB_DATA_DIR`, `DSH_HUB_PIDFILE` and `NODE_BINARY`. `openrc-run` and
-sysvinit pass on **exported** variables only:
+`DSH_HUB_PIDFILE` and `NODE_BINARY`. `openrc-run` and sysvinit pass on
+**exported** variables only:
 
 ```sh
 # /etc/conf.d/dsh-hub  ·  /etc/default/dsh-hub
@@ -149,7 +151,8 @@ with it.
 |---|---|---|
 | `HUB_LOG_DIR` | `/var/log/dsh-hub` | per-user dsh logs; also the default audit-log directory |
 | `HUB_AUTH_LOG` | `<HUB_LOG_DIR>/auth.log` | append-only authentication audit log (`0600`) |
-| `HUB_CLEAN_ON_STOP` | `1` | on stop, delete `$CWD/cache`; `0` keeps the session-list cache |
+| `CACHE_DIRECTORY` | *(unset: memory-only)* | persistent session-list cache root; systemd `CacheDirectory=dsh-hub` sets it to `/var/cache/dsh-hub` |
+| `HUB_CLEAN_ON_STOP` | `1` | on stop, delete the persisted cache (only when `CACHE_DIRECTORY` is set); `0` keeps it |
 | `HUB_WEB_CONFIG_DIR` | `/etc/dsh-hub/web_config.d` | `*.yml` drop-ins applied as `--patch` to spawned instances, in file-name order |
 | `ALLOW_USERS` | *(all)* | comma-separated username allow-list |
 | `ALLOW_NOPASSWD` | `0` | allow an account whose shadow entry has no usable password to receive a session |
@@ -352,8 +355,8 @@ fall back to stdout/journald.
   `<HUB_LOG_DIR>/dsh.log`.
 - On `SIGTERM`/`SIGINT`/`SIGHUP` the whole dsh process group is stopped
   (`SIGTERM`, then `SIGKILL` after `SHUTDOWN_GRACE_MS`), the hub's loopback
-  guards are released, and the hub's persisted cache is removed unless
-  `HUB_CLEAN_ON_STOP=0`.
+  guards are released, and the hub's persisted session-list cache is removed
+  unless `HUB_CLEAN_ON_STOP=0` (a memory-only cache has nothing to remove).
 
 ### Keep-alive and quit
 
@@ -438,9 +441,11 @@ passes dsh's own 401 through.
 
 The hub serves a stale `/api/session/list` snapshot forever and refreshes it in
 the background on a throttle. The cache makes the sidebar instant even when
-dsh's projection is slow; it survives hub restarts under `$CWD/cache/`, and a
-cache hit never spawns an instance. Only 200 responses whose envelope carries an
-`items` array are cached, keyed by user plus request payload.
+dsh's projection is slow, and a cache hit never spawns an instance. It is
+**memory-only by default**; set `CACHE_DIRECTORY` (systemd:
+`CacheDirectory=dsh-hub` → `/var/cache/dsh-hub`) to persist it across restarts.
+Only 200 responses whose envelope carries an `items` array are cached, keyed by
+user plus request payload.
 
 ## Global dsh overlays (hub)
 
@@ -449,7 +454,9 @@ without touching dsh or the hub: drop `*.yml` (or `*.yaml`) files into
 `/etc/dsh-hub/web_config.d` (`HUB_WEB_CONFIG_DIR` overrides the path). Files are
 passed to each spawned dsh as `--patch` overlays in file-name order, so prefixes
 (`10-`, `20-`) control precedence. The directory is re-read on every spawn; the
-startup log lists what was applied.
+startup log lists what was applied. It is optional: if it is missing, no
+overlays are applied. The active default example shipped with the repo is
+`packaging/web_config.d/web-ui.patch.yml`.
 
 Global configuration is authoritative: dsh applies `--patch` after
 `$DSH_HOME/cordis.patch.yml`, so a drop-in overrides the user's own patch for the
@@ -513,9 +520,10 @@ Both modes keep dsh unmodified and on loopback; the front is the only listener.
 - Cold start is visible: the loading page refreshes every 3 s until the
   instance's index is ready. A first launch can take a while; subsequent
   launches reuse the same data root and are faster.
-- Runtime state for the hub lives in the working directory it is started from
-  (`WorkingDirectory` under systemd): the persisted `session.list` cache lives
-  under `$CWD/cache/`. The source tree can stay read-only.
+- The hub has no writable state in its working directory (`WorkingDirectory=/`
+  under systemd). The session-list cache is memory-only by default; enabling
+  `CACHE_DIRECTORY` persists it under `/var/cache/dsh-hub`. The source tree can
+  stay read-only.
 - The hub's sessions are invalidated by a password change or lock because the
   cookie key follows the shadow entry; the proxy's sessions are not, because the
   proxy has no shadow access. Both are invalidated by a process restart.
