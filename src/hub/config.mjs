@@ -19,9 +19,12 @@ export const CFG = {
   allowUsers: (process.env.ALLOW_USERS ?? '')
     .split(',').map((s) => s.trim()).filter(Boolean),
   logDir: process.env.HUB_LOG_DIR ?? '/var/log/dsh-hub',
-  // On SIGTERM/SIGINT/SIGHUP: stop every spawned instance, then delete the
-  // persisted session-list cache. Set HUB_CLEAN_ON_STOP=0 to keep the cache.
-  cleanOnStop: process.env.HUB_CLEAN_ON_STOP !== '0',
+  // Session-list cache: memory is on by default; the disk tier is enabled by
+  // CACHE_DIRECTORY (systemd CacheDirectory=dsh-hub). TTL is independent of the
+  // instance idle cull; the entry expires after a content change.
+  cacheMemTtlMs: int(process.env.CACHE_MEM_TTL_MS, 4 * 60 * 60 * 1000),
+  cacheMemoryMaxBytes: int(process.env.CACHE_MEMORY_MAX_BYTES, 256 * 1024 * 1024),
+  cacheEntryMaxBytes: int(process.env.CACHE_ENTRY_MAX_BYTES, 32 * 1024 * 1024),
   // A shadow entry with no usable password is denied a session unless this is
   // set. Empty/locked hashes (`!`, `*`, `x`) count as no password.
   allowNoPassword: process.env.ALLOW_NOPASSWD === '1',

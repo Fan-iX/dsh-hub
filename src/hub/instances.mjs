@@ -9,7 +9,7 @@ import { CFG, IPTABLES, IS_ROOT, TRUSTED_HOSTS, TRUST_MODE } from './config.mjs'
 import { lookupUser } from '../backend/auth.mjs';
 import { DshInstance, startCuller } from '../backend/instance.mjs';
 import { webConfigPatches } from './web-config.mjs';
-import { prewarmSessionList } from './session-list-cache.mjs';
+import { forgetUserCache, prewarmSessionList } from './session-list-cache.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -110,6 +110,7 @@ export async function getOrCreateBackend(user) {
     onSpawn: (be) => addGuard(be.port, info.uid),
     onExit: (be) => {
       void removeGuard(be.port, info.uid);
+      forgetUserCache(user); // hot memory follows the instance; the disk survives
       if (backends.get(user) === be) backends.delete(user);
     },
   });

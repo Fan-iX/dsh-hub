@@ -21,7 +21,6 @@ import fs from 'node:fs';
 import {
   AUTH_LOG_FILE, CACHE_DIR, CFG, IPTABLES, IS_ROOT, TRUSTED_HOSTS, TRUST_MODE,
 } from './config.mjs';
-import { loadPersistedCache } from './session-list-cache.mjs';
 import { createHubServer } from './server.mjs';
 import { createShutdown, registerSignalHandlers } from './shutdown.mjs';
 import { webConfigPatches } from './web-config.mjs';
@@ -33,7 +32,6 @@ if (!IS_ROOT) {
 }
 
 // -------------------------------------------------------------------- wire ---
-loadPersistedCache(); // restore session-list cache entries across hub restarts
 const adminPatches = webConfigPatches();
 const server = createHubServer();
 registerSignalHandlers(createShutdown(server));
@@ -53,11 +51,10 @@ server.listen(CFG.hubPort, CFG.hubHost, () => {
     + ' per IP'
     + (CFG.trustedProxies.length ? `, trusting X-Forwarded-For from ${CFG.trustedProxies.join(', ')}` : ', using the TCP peer address only'));
   console.log(`[hub] auth audit log: ${AUTH_LOG_FILE}`);
-  console.log(CACHE_DIR === null
-    ? '[hub] session-list cache: memory-only (set CACHE_DIRECTORY, or systemd CacheDirectory=dsh-hub, to persist)'
-    : CFG.cleanOnStop
-      ? `[hub] on SIGTERM/SIGINT/SIGHUP: stop instances and remove ${CACHE_DIR}`
-      : '[hub] on stop: instances stopped, cache kept (HUB_CLEAN_ON_STOP=0)');
+  console.log(`[hub] session-list cache: ${CACHE_DIR === null ? 'memory-only' : `persist ${CACHE_DIR}`}`
+    + ` (mem ${Math.round(CFG.cacheMemoryMaxBytes / 1024 / 1024)}MB,`
+    + ` entry ${Math.round(CFG.cacheEntryMaxBytes / 1024 / 1024)}MB,`
+    + ` ttl ${Math.round(CFG.cacheMemTtlMs / 60000)}min)`);
   console.log(CFG.idleCullMs === 0
     ? '[hub] idle culling DISABLED — backends run until stopped'
     : `[hub] idle cull after ${Math.round(CFG.idleCullMs / 60000)} min`);

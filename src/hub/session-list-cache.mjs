@@ -1,118 +1,462 @@
-// Serve-stale cache for the /api/session/list RPC, which can take tens of
-// seconds on a cold store. See the section comment below for the full contract.
+// Serve-stale /api/session/list cache with two tiers:
+//  - memory: one standard-payload entry per user, for browser page reconnects;
+//  - disk: optional, one <user>.cache file per user, for respawning an instance
+//    without a cold session-list projection.
+//
+// The cached body is canonical: the top-level rpcId value is replaced by "" and
+// the value span is recorded, so the caller's rpcId can be written without
+// parsing or copying the whole response. Disk files store the raw canonical
+// body after a small binary header; no base64, no JSON round-trip.
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 
-import { CACHE_DIR } from './config.mjs';
+import { CACHE_DIR, CFG } from './config.mjs';
 import { hubDshCookieHeader } from '../backend/dsh-proxy.mjs';
 import { sanitizeForwardHeaders } from '../backend/web.mjs';
 
-// ------------------------------------------- /api/session/list response cache --
-// dsh's session/list recomputes projections for every session (zstd-decode of
-// large logs + projection apply); on this deployment it routinely takes
-// 40-66s — far past the web client's 30s unary timeout, so the sidebar renders
-// no history whenever the cache is cold. This cache makes the sidebar always
-// instant: once a 200 response exists for a key it is served forever
-// (serve-stale), with one throttled background revalidation refreshing it.
-// A cached hit never spawns the backend, so idle culling keeps working.
-// Revalidation failures keep the stale entry and back off, so a dead backend
-// never empties the sidebar. Only 200 responses are cached; keys are per
-// user + request-body hash so different payloads never mix.
-//
-// The wire endpoint is `session/list` (slash, not the old `session.list`) and
-// its args travel as `payload.args._request`; a cached server-response is
-// republished under the caller's rpcId because the client rejects a mismatched
-// echo. Background refresh presents the same dsh browser cookie the hub mints.
 export const SESSION_LIST_PATH = '/api/session/list';
-const RPC_CACHE_REVALIDATE_MS = 60_000;   // min gap between background refreshes (12MB responses; keep the hub event loop free)
-const RPC_CACHE_FAIL_BACKOFF_MS = 30_000; // pause after a failed refresh
-const SESSION_LIST_TIMEOUT_MS = 120_000;  // a cold store can take 40-66s; never let a forward hang forever
-export const rpcCache = new Map(); // key -> { status, headers, body, nextRevalidateAt, inflight }
-const RPC_CACHE_MAX = 500;
-const prewarmInflight = new Set();
-// Persistence is opt-in: when CACHE_DIRECTORY is set (systemd CacheDirectory)
-// entries are written under it; otherwise the cache stays in memory only.
-const CACHE_PERSIST_GAP_MS = 300_000;     // throttle disk writes per key (16MB base64 files; async, off the hot path)
+const REVALIDATE_MS = 60_000;
+const MEM_TTL_MS = CFG.cacheMemTtlMs;
+const MEM_MAX_BYTES = CFG.cacheMemoryMaxBytes;
+const ENTRY_MAX_BYTES = CFG.cacheEntryMaxBytes;
+const MEM_SWEEP_MS = 60_000;
+const SESSION_LIST_TIMEOUT_MS = 120_000;
+const DISK_MAGIC = Buffer.from('DSHC');
+const DISK_VERSION = 1;
+const HEADER_FIXED = 10; // magic(4) + version(u16) + headerLen(u32)
+
 const STANDARD_SESSION_LIST_BODY = Buffer.from(JSON.stringify({
   type: 'client-request', rpcId: 'hub-prewarm', method: 'session/list',
   payload: { args: { _request: {} } },
 }));
 
-export function sessionListCacheKey(user, body) {
-  // Hash only the payload (not rpcId), so hub prewarm and browser requests share a key.
-  let payload = body;
+const memory = new Map(); // user -> { body, prefixEnd, suffixStart, bodyLen, hash, ... }
+let memoryBytes = 0;
+const revalidateAt = new Map(); // user -> timestamp
+const prewarmInflight = new Set();
+const diskQueue = new Map(); // user -> Promise (serialize writes per user)
+
+// --------------------------------------------------------------- hashing ----
+
+/** Change-detection hash; MD5 is the fastest built-in, SHA-256 is the FIPS fallback. */
+function contentHash(buf) {
+  try {
+    if (typeof crypto.hash === 'function') return crypto.hash('md5', buf).toString('hex');
+  } catch { /* MD5 unavailable (e.g. FIPS) */ }
+  return crypto.createHash('sha256').update(buf).digest('hex');
+}
+
+// ------------------------------------------------------- canonical body -----
+
+/**
+ * Find the value span of the top-level `rpcId` key, without parsing the body.
+ * Only a depth-1 object key counts, so `"rpcId"` inside a session title, a
+ * nested object, or an escaped string is ignored.
+ * @returns `{ start, end }` covering the JSON string value (both quotes), or null.
+ */
+function findTopLevelRpcId(body) {
+  const n = body.length;
+  let i = 0;
+  const isWs = (c) => c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0d;
+  const skipWs = () => { while (i < n && isWs(body[i])) i++; };
+  const skipString = () => {
+    if (body[i] !== 0x22) return false;
+    i++;
+    while (i < n) {
+      if (body[i] === 0x5c) { i += 2; continue; }
+      if (body[i] === 0x22) { i++; return true; }
+      i++;
+    }
+    return false;
+  };
+  const skipValue = () => {
+    if (body[i] === 0x22) return skipString();
+    if (body[i] === 0x7b || body[i] === 0x5b) {
+      let depth = 0;
+      while (i < n) {
+        const c = body[i];
+        if (c === 0x22) { if (!skipString()) return false; continue; }
+        if (c === 0x7b || c === 0x5b) { depth++; i++; continue; }
+        if (c === 0x7d || c === 0x5d) { depth--; i++; if (depth === 0) return true; continue; }
+        i++;
+      }
+      return false;
+    }
+    while (i < n) {
+      const c = body[i];
+      if (c === 0x2c || c === 0x7d || c === 0x5d || isWs(c)) return true;
+      i++;
+    }
+    return true;
+  };
+
+  skipWs();
+  if (body[i] !== 0x7b) return null;
+  i++;
+  for (;;) {
+    skipWs();
+    if (i >= n || body[i] === 0x7d) return null;
+    if (body[i] !== 0x22) return null;
+    const keyStart = i + 1;
+    if (!skipString()) return null;
+    const key = body.toString('latin1', keyStart, i - 1);
+    skipWs();
+    if (body[i] !== 0x3a) return null;
+    i++;
+    skipWs();
+    if (key === 'rpcId') {
+      if (body[i] !== 0x22) return null;
+      const start = i;
+      if (!skipString()) return null;
+      return { start, end: i };
+    }
+    if (!skipValue()) return null;
+    skipWs();
+    if (i < n && body[i] === 0x2c) { i++; continue; }
+    // A top-level object without rpcId is not cacheable.
+    return null;
+  }
+}
+
+/**
+ * Replace the top-level rpcId value with "" and record its span. The body stays
+ * valid JSON; serving writes prefix + caller rpcId + suffix.
+ * @returns `{ body, prefixEnd, suffixStart, bodyLen, hash }`, or null.
+ */
+function canonicalize(body) {
+  const span = findTopLevelRpcId(body);
+  if (span === null) return null;
+  const canonical = Buffer.concat([
+    body.subarray(0, span.start),
+    Buffer.from('""'),
+    body.subarray(span.end),
+  ]);
+  return {
+    body: canonical,
+    prefixEnd: span.start,
+    suffixStart: span.start + 2,
+    bodyLen: canonical.length,
+    hash: contentHash(canonical),
+  };
+}
+
+// --------------------------------------------------------------- memory -----
+
+function memoryDelete(user) {
+  const entry = memory.get(user);
+  if (entry === undefined) return;
+  memoryBytes -= entry.bytes;
+  memory.delete(user);
+}
+
+function evictFor(bytes) {
+  while (memoryBytes + bytes > MEM_MAX_BYTES && memory.size > 0) {
+    let oldestUser;
+    let oldest = Infinity;
+    for (const [user, entry] of memory) {
+      if (entry.lastUsed < oldest) { oldest = entry.lastUsed; oldestUser = user; }
+    }
+    if (oldestUser === undefined) break;
+    memoryDelete(oldestUser);
+  }
+}
+
+function memorySet(user, entry) {
+  memoryDelete(user);
+  if (entry.bytes > ENTRY_MAX_BYTES) return;
+  evictFor(entry.bytes);
+  if (memoryBytes + entry.bytes > MEM_MAX_BYTES) return;
+  memory.set(user, entry);
+  memoryBytes += entry.bytes;
+}
+
+/** The hot entry for `user`, or null when absent/expired. */
+export function memoryLookup(user) {
+  const entry = memory.get(user);
+  if (entry === undefined) return null;
+  if (Date.now() - entry.refreshedAt >= MEM_TTL_MS) { memoryDelete(user); return null; }
+  entry.lastUsed = Date.now();
+  return entry;
+}
+
+/** Drop the hot entry for a user; the disk file is intentionally kept. */
+export function forgetUserCache(user) {
+  memoryDelete(user);
+  revalidateAt.delete(user);
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [user, entry] of memory) {
+    if (now - entry.refreshedAt >= MEM_TTL_MS) memoryDelete(user);
+  }
+}, MEM_SWEEP_MS).unref();
+
+// ----------------------------------------------------------------- disk -----
+
+function diskPath(user) {
+  if (!/^[a-z_][a-z0-9_-]{0,31}$/i.test(user)) return null;
+  return path.join(CACHE_DIR, `${user}.cache`);
+}
+
+function headerFor(canonical, contentType, status, savedAt) {
+  return Buffer.from(JSON.stringify({
+    status,
+    contentType,
+    savedAt,
+    bodyLen: canonical.bodyLen,
+    prefixEnd: canonical.prefixEnd,
+    suffixStart: canonical.suffixStart,
+    hash: canonical.hash,
+  }));
+}
+
+async function readDiskHeader(user) {
+  if (CACHE_DIR === null) return null;
+  const file = diskPath(user);
+  if (file === null) return null;
+  let handle;
+  try {
+    handle = await fs.promises.open(file, 'r');
+    const fixed = Buffer.alloc(HEADER_FIXED);
+    const got = await handle.read(fixed, 0, HEADER_FIXED, 0);
+    if (got.bytesRead !== HEADER_FIXED) return null;
+    if (!fixed.subarray(0, 4).equals(DISK_MAGIC)) return null;
+    if (fixed.readUInt16LE(4) !== DISK_VERSION) return null;
+    const headerLen = fixed.readUInt32LE(6);
+    if (headerLen <= 0 || headerLen > 64 * 1024) return null;
+    const headerBuf = Buffer.alloc(headerLen);
+    const head = await handle.read(headerBuf, 0, headerLen, HEADER_FIXED);
+    if (head.bytesRead !== headerLen) return null;
+    const meta = JSON.parse(headerBuf.toString('utf8'));
+    const stat = await handle.stat();
+    const bodyOffset = HEADER_FIXED + headerLen;
+    if (!Number.isInteger(meta.bodyLen) || meta.bodyLen < 0) return null;
+    if (bodyOffset + meta.bodyLen > stat.size) return null;
+    if (!Number.isInteger(meta.prefixEnd) || !Number.isInteger(meta.suffixStart)) return null;
+    if (meta.prefixEnd < 0 || meta.suffixStart < meta.prefixEnd + 2) return null;
+    if (meta.suffixStart > meta.bodyLen) return null;
+    return { file, bodyOffset, ...meta };
+  } catch {
+    return null;
+  } finally {
+    if (handle !== undefined) await handle.close().catch(() => {});
+  }
+}
+
+/** Load one user's disk entry metadata (no body read); null on miss/corruption. */
+export async function loadDiskEntry(user) {
+  const meta = await readDiskHeader(user);
+  if (meta === null) return null;
+  return {
+    file: meta.file,
+    bodyOffset: meta.bodyOffset,
+    prefixEnd: meta.prefixEnd,
+    suffixStart: meta.suffixStart,
+    bodyLen: meta.bodyLen,
+    hash: meta.hash,
+    contentType: typeof meta.contentType === 'string' ? meta.contentType : 'application/json',
+    status: Number.isInteger(meta.status) ? meta.status : 200,
+    refreshedAt: Number.isFinite(meta.savedAt) ? meta.savedAt : Date.now(),
+    lastUsed: Date.now(),
+    bytes: meta.bodyLen,
+  };
+}
+
+async function writeDisk(file, canonical, contentType, status) {
+  await fs.promises.mkdir(CACHE_DIR, { recursive: true, mode: 0o700 });
+  const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+  const header = headerFor(canonical, contentType, status, Date.now());
+  const fixed = Buffer.alloc(HEADER_FIXED);
+  DISK_MAGIC.copy(fixed, 0);
+  fixed.writeUInt16LE(DISK_VERSION, 4);
+  fixed.writeUInt32LE(header.length, 6);
+  const handle = await fs.promises.open(tmp, 'w', 0o600);
+  try {
+    await handle.write(fixed, 0, fixed.length, 0);
+    await handle.write(header, 0, header.length, fixed.length);
+    await handle.write(canonical.body, 0, canonical.body.length, fixed.length + header.length);
+  } catch (err) {
+    await handle.close().catch(() => {});
+    await fs.promises.unlink(tmp).catch(() => {});
+    throw err;
+  }
+  await handle.close();
+  try {
+    await fs.promises.rename(tmp, file);
+  } catch (err) {
+    await fs.promises.unlink(tmp).catch(() => {});
+    throw err;
+  }
+}
+
+async function persistDiskNow(user, canonical, contentType, status) {
+  const meta = await readDiskHeader(user);
+  if (meta !== null && meta.hash === canonical.hash) return; // content unchanged
+  const file = diskPath(user);
+  if (file === null) return;
+  await writeDisk(file, canonical, contentType, status);
+}
+
+/** Queue a disk write; writes are serialized per user and only on content change. */
+function persistDisk(user, canonical, contentType, status) {
+  if (CACHE_DIR === null || diskPath(user) === null) return;
+  const prev = diskQueue.get(user) ?? Promise.resolve();
+  const next = prev
+    .then(() => persistDiskNow(user, canonical, contentType, status))
+    .catch((err) => console.error(`[hub] session.list disk cache write failed for ${user}:`, err.message))
+    .finally(() => { if (diskQueue.get(user) === next) diskQueue.delete(user); });
+  diskQueue.set(user, next);
+}
+
+// -------------------------------------------------------------- serving -----
+
+/**
+ * Write a cached entry under `rpcId`: prefix + escaped rpcId + suffix.
+ * Memory entries are served from Buffer slices; disk entries stream the suffix
+ * from the file without loading the whole body.
+ * @returns true when a response was written.
+ */
+export async function serveCachedSessionList(res, entry, rpcId) {
+  if (rpcId === undefined || res.destroyed || res.writableEnded) return false;
+  const escaped = JSON.stringify(rpcId);
+  const length = entry.prefixEnd + Buffer.byteLength(escaped) + (entry.bodyLen - entry.suffixStart);
+
+  if (entry.body !== undefined) {
+    res.writeHead(entry.status, {
+      'content-type': entry.contentType ?? 'application/json',
+      'content-length': length,
+    });
+    res.write(entry.body.subarray(0, entry.prefixEnd));
+    res.write(escaped);
+    res.write(entry.body.subarray(entry.suffixStart));
+    res.end();
+    return true;
+  }
+
+  // Disk: read the (normally tiny) prefix before committing the headers so a
+  // missing/truncated file can still fall back to forwarding.
+  const prefix = Buffer.alloc(entry.prefixEnd);
+  if (entry.prefixEnd > 0) {
+    const handle = await fs.promises.open(entry.file, 'r');
+    try {
+      const got = await handle.read(prefix, 0, entry.prefixEnd, entry.bodyOffset);
+      if (got.bytesRead !== entry.prefixEnd) throw new Error('truncated cache prefix');
+    } finally {
+      await handle.close().catch(() => {});
+    }
+  }
+  if (res.destroyed || res.writableEnded) return true;
+  res.writeHead(entry.status, {
+    'content-type': entry.contentType ?? 'application/json',
+    'content-length': length,
+  });
+  res.write(prefix);
+  res.write(escaped);
+  if (entry.suffixStart >= entry.bodyLen) {
+    res.end();
+    return true;
+  }
+  await new Promise((resolve, reject) => {
+    const stream = fs.createReadStream(entry.file, {
+      start: entry.bodyOffset + entry.suffixStart,
+      end: entry.bodyOffset + entry.bodyLen - 1,
+    });
+    let settled = false;
+    const done = (err) => {
+      if (settled) return;
+      settled = true;
+      stream.destroy();
+      if (err) reject(err); else resolve();
+    };
+    stream.on('error', done);
+    stream.on('end', () => done());
+    res.on('close', () => done());
+    stream.pipe(res);
+  });
+  return true;
+}
+
+// ------------------------------------------------------------- rewrite ------
+
+/**
+ * Store one fresh captured response. The memory entry expires after
+ * CACHE_MEM_TTL_MS from the last content change; the disk is written only when
+ * the canonical body (rpcId replaced by "") changed.
+ */
+export function storeSessionList(user, captured) {
+  if (!isCacheableSessionList(captured)) return null;
+  const canonical = canonicalize(captured.body);
+  if (canonical === null) return null; // no top-level string rpcId: not servable
+  const now = Date.now();
+  const existing = memory.get(user);
+  const changed = existing === undefined || existing.hash !== canonical.hash;
+  const contentType = captured.headers['content-type'] ?? 'application/json';
+  const entry = {
+    body: canonical.body,
+    prefixEnd: canonical.prefixEnd,
+    suffixStart: canonical.suffixStart,
+    bodyLen: canonical.bodyLen,
+    hash: canonical.hash,
+    contentType,
+    status: captured.status,
+    refreshedAt: changed ? now : existing.refreshedAt,
+    lastUsed: now,
+    bytes: canonical.bodyLen,
+  };
+  if (entry.bytes <= ENTRY_MAX_BYTES) memorySet(user, entry);
+  else memoryDelete(user);
+  persistDisk(user, canonical, contentType, captured.status);
+  return entry;
+}
+
+// ------------------------------------------------------------ lifecycle -----
+
+/** True when the body is `this.remote.session.list({})` (the standard payload). */
+export function isStandardSessionList(body) {
+  let parsed;
+  try {
+    parsed = JSON.parse(body.toString('utf8'));
+  } catch {
+    return false;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+  if (parsed.type !== 'client-request' || parsed.method !== 'session/list') return false;
+  const payload = parsed.payload;
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) return false;
+  if (Object.keys(payload).length !== 1) return false;
+  const args = payload.args;
+  if (args === null || typeof args !== 'object' || Array.isArray(args)) return false;
+  if (Object.keys(args).length !== 1) return false;
+  const request = args._request;
+  return request !== null && typeof request === 'object'
+    && !Array.isArray(request) && Object.keys(request).length === 0;
+}
+
+/** The rpcId a client-request envelope carries, when the body is one. */
+export function requestRpcId(body) {
   try {
     const parsed = JSON.parse(body.toString('utf8'));
-    if (parsed !== null && typeof parsed === 'object' && 'payload' in parsed) {
-      payload = Buffer.from(JSON.stringify(parsed.payload));
-    }
+    return typeof parsed?.rpcId === 'string' ? parsed.rpcId : undefined;
   } catch {
-    /* keep full-body hash */
+    return undefined;
   }
-  const hash = crypto.createHash('sha256').update(payload).digest('hex').slice(0, 16);
-  return `${user}:session/list:${hash}`;
 }
 
-function cacheFilePathFor(key) {
-  return path.join(CACHE_DIR, `${crypto.createHash('sha256').update(key).digest('hex')}.json`);
-}
-
-function persistCacheEntry(key, entry) {
-  if (CACHE_DIR === null) return; // memory-only
-  const now = Date.now();
-  if (entry.lastPersistAt !== undefined && now - entry.lastPersistAt < CACHE_PERSIST_GAP_MS) return;
-  // Async write: a 16MB base64 payload must never block the event loop — the
-  // hub proxies the browser's WebSocket event streams, and a sync disk write
-  // here stalls them long enough to break the app's 3s readiness handshake.
-  entry.lastPersistAt = now;
-  fs.promises.mkdir(CACHE_DIR, { recursive: true })
-    .then(() => fs.promises.writeFile(cacheFilePathFor(key), JSON.stringify({
-      key,
-      status: entry.status,
-      contentType: entry.headers['content-type'] ?? 'application/json',
-      bodyB64: entry.body.toString('base64'),
-      nextRevalidateAt: entry.nextRevalidateAt,
-    })))
-    .catch((err) => console.error('[hub] session.list cache persist failed:', err.message));
-}
-
-export function loadPersistedCache() {
-  if (CACHE_DIR === null) return; // memory-only
+/** A cacheable session.list payload: non-empty 200 carrying an items array. */
+export function isCacheableSessionList(captured) {
+  if (captured.status !== 200 || captured.body.length === 0) return false;
   try {
-    const files = fs.readdirSync(CACHE_DIR).filter((f) => f.endsWith('.json'));
-    files.sort((a, b) => {
-      const sa = fs.statSync(path.join(CACHE_DIR, a)).mtimeMs;
-      const sb = fs.statSync(path.join(CACHE_DIR, b)).mtimeMs;
-      return sa - sb;
-    });
-    const keep = files.slice(-RPC_CACHE_MAX);
-    for (const file of files) {
-      if (!keep.includes(file)) {
-        try { fs.unlinkSync(path.join(CACHE_DIR, file)); } catch { /* best-effort */ }
-      }
-    }
-    for (const file of keep) {
-      try {
-        const raw = JSON.parse(fs.readFileSync(path.join(CACHE_DIR, file), 'utf8'));
-        if (typeof raw.key !== 'string' || typeof raw.bodyB64 !== 'string' || raw.status !== 200) continue;
-        rpcCache.set(raw.key, {
-          status: raw.status,
-          headers: { 'content-type': raw.contentType },
-          body: Buffer.from(raw.bodyB64, 'base64'),
-          nextRevalidateAt: raw.nextRevalidateAt ?? 0, // past → revalidate on first hit
-          inflight: false,
-        });
-      } catch (err) {
-        console.error('[hub] session.list cache load failed for', file, err.message);
-      }
-    }
-  } catch (err) {
-    if (err.code !== 'ENOENT') console.error('[hub] session.list cache dir read failed:', err.message);
+    const parsed = JSON.parse(captured.body.toString('utf8'));
+    return parsed?.result?.ok === true && Array.isArray(parsed.result.value?.items);
+  } catch {
+    return false;
   }
-  if (rpcCache.size > 0) console.log(`[hub] loaded ${rpcCache.size} persisted session.list cache entries`);
 }
+
+// ----------------------------------------------------------- forwarding -----
 
 export function forwardSessionList(be, headers, body, signal) {
   return new Promise((resolve, reject) => {
@@ -151,127 +495,30 @@ export function forwardSessionList(be, headers, body, signal) {
   });
 }
 
-/** The rpcId a client-request envelope carries, when the body is one. */
-export function requestRpcId(body) {
-  try {
-    const parsed = JSON.parse(body.toString('utf8'));
-    return typeof parsed?.rpcId === 'string' ? parsed.rpcId : undefined;
-  } catch {
-    return undefined;
-  }
+export async function revalidateSessionList(user, be, body) {
+  revalidateAt.set(user, Date.now());
+  const cookie = await hubDshCookieHeader(be);
+  const headers = { accept: 'application/json', 'content-type': 'application/json' };
+  if (cookie) headers.cookie = cookie;
+  const captured = await forwardSessionList(be, headers, body);
+  if (captured.status === 401) be.internalCookie = null; // rotated secret: re-mint next time
+  storeSessionList(user, captured);
 }
 
-/**
- * Republish a cached server-response under the caller's rpcId (the client
- * rejects a mismatched echo). This runs on every cache hit with bodies up to
- * ~12 MB, so splice the first top-level `"rpcId"` value in the buffer instead of
- * JSON.parse + JSON.stringify over the whole payload, which blocks the event
- * loop long enough to stall the WebSocket event streams.
- */
-function withRpcId(body, rpcId) {
-  if (rpcId === undefined) return body;
-  const key = body.indexOf('"rpcId"');
-  if (key === -1) return body;
-  const colon = body.indexOf(':', key + 7);
-  if (colon === -1) return body;
-  let start = colon + 1;
-  while (start < body.length && (body[start] === 0x20 || body[start] === 0x09
-    || body[start] === 0x0a || body[start] === 0x0d)) start++;
-  if (body[start] !== 0x22) return body;
-  let end = start + 1;
-  for (; end < body.length; end++) {
-    if (body[end] === 0x5c) { end++; continue; } // skip the escaped byte
-    if (body[end] === 0x22) break;
-  }
-  if (end >= body.length) return body;
-  return Buffer.concat([
-    body.subarray(0, start),
-    Buffer.from(JSON.stringify(rpcId)),
-    body.subarray(end + 1),
-  ]);
-}
-
-export function serveCachedSessionList(res, entry, rpcId) {
-  if (res.destroyed || res.writableEnded) return;
-  const body = withRpcId(entry.body, rpcId);
-  try {
-    res.writeHead(entry.status, {
-      'content-type': entry.headers['content-type'] ?? 'application/json',
-      'content-length': body.length,
-    });
-    res.end(body);
-  } catch {
-    /* client already gone — nothing to serve */
-  }
-}
-
-/** A cacheable session.list payload: non-empty 200 whose envelope parses and carries an items array. */
-export function isCacheableSessionList(captured) {
-  if (captured.status !== 200 || captured.body.length === 0) return false;
-  try {
-    const parsed = JSON.parse(captured.body.toString('utf8'));
-    return parsed?.result?.ok === true && Array.isArray(parsed.result.value?.items);
-  } catch {
-    return false;
-  }
-}
-
-export async function revalidateSessionList(user, be, body, key) {
+/** Refresh a hot entry at most once per REVALIDATE_MS. */
+export function maybeRevalidateSessionList(user, be, body) {
   const now = Date.now();
-  try {
-    const cookie = await hubDshCookieHeader(be);
-    const headers = { accept: 'application/json', 'content-type': 'application/json' };
-    if (cookie) headers.cookie = cookie;
-    const captured = await forwardSessionList(be, headers, body);
-    if (captured.status === 401) be.internalCookie = null; // rotated secret: re-mint on the next attempt
-    if (isCacheableSessionList(captured)) {
-      const entry = { ...captured, nextRevalidateAt: now + RPC_CACHE_REVALIDATE_MS, inflight: false };
-      rpcCache.set(key, entry);
-      persistCacheEntry(key, entry);
-    } else {
-      // Half-started backends answer 200 with an empty/partial body; never
-      // let that clobber a good snapshot — keep the old entry and back off.
-      const entry = rpcCache.get(key);
-      if (entry) entry.nextRevalidateAt = now + RPC_CACHE_FAIL_BACKOFF_MS;
-    }
-  } catch (err) {
-    console.error(`[hub] session.list revalidate failed for ${user}:`, err.message);
-    // Keep serving the stale snapshot; back off so a dead backend is not hammered.
-    const entry = rpcCache.get(key);
-    if (entry) entry.nextRevalidateAt = now + RPC_CACHE_FAIL_BACKOFF_MS;
-  } finally {
-    const entry = rpcCache.get(key);
-    if (entry) entry.inflight = false;
-  }
+  if (now - (revalidateAt.get(user) ?? 0) < REVALIDATE_MS) return;
+  revalidateAt.set(user, now);
+  void revalidateSessionList(user, be, body)
+    .catch((err) => console.error(`[hub] session.list revalidate failed for ${user}:`, err.message));
 }
 
-/** Warm the session-list cache right after a backend spawn, without a browser request. */
+/** Warm the cache after a backend spawn, without a browser request. */
 export function prewarmSessionList(user, be) {
-  const key = sessionListCacheKey(user, STANDARD_SESSION_LIST_BODY);
-  if (rpcCache.has(key) || prewarmInflight.has(key)) return;
-  prewarmInflight.add(key);
-  revalidateSessionList(user, be, STANDARD_SESSION_LIST_BODY, key)
+  if (prewarmInflight.has(user)) return;
+  prewarmInflight.add(user);
+  void revalidateSessionList(user, be, STANDARD_SESSION_LIST_BODY)
     .catch((err) => console.error(`[hub] session.list prewarm failed for ${user}:`, err.message))
-    .finally(() => prewarmInflight.delete(key));
-}
-
-/** Release a cache entry that could not be refreshed (no live backend). */
-export function deferSessionList(entry) {
-  entry.inflight = false;
-  entry.nextRevalidateAt = Date.now() + RPC_CACHE_FAIL_BACKOFF_MS;
-}
-
-/** Store one freshly captured 200 snapshot, evicting the oldest key at the cap. */
-export function storeSessionList(key, captured) {
-  if (rpcCache.size >= RPC_CACHE_MAX) {
-    const oldest = rpcCache.keys().next().value;
-    if (oldest !== undefined) rpcCache.delete(oldest);
-  }
-  const entry = {
-    ...captured,
-    nextRevalidateAt: Date.now() + RPC_CACHE_REVALIDATE_MS,
-    inflight: false,
-  };
-  rpcCache.set(key, entry);
-  persistCacheEntry(key, entry);
+    .finally(() => prewarmInflight.delete(user));
 }

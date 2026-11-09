@@ -1,10 +1,8 @@
 // Graceful stop for the multi-user hub: kill every spawned instance's process
-// group, release its loopback guard, delete the persisted cache when enabled,
-// and exit. Cleanup is best-effort and bounded so a wedged backend can never
-// keep the process alive.
-import fs from 'node:fs';
-
-import { CACHE_DIR, CFG } from './config.mjs';
+// group, release its loopback guard, and exit. The persistent cache is left in
+// place (the administrator owns its lifecycle). Cleanup is best-effort and
+// bounded so a wedged backend can never keep the process alive.
+import { CFG } from './config.mjs';
 import { backends, removeGuard } from './instances.mjs';
 
 let shuttingDown = false;
@@ -14,21 +12,6 @@ function forceKillBackends() {
   for (const be of backends.values()) {
     be.kill('SIGKILL');
     void removeGuard(be.port, be.info.uid);
-  }
-}
-
-/** Delete the persisted cache unless persistence is disabled or cleanup is off. */
-function removeRuntimeState() {
-  if (CACHE_DIR === null) return; // memory-only: nothing on disk
-  if (!CFG.cleanOnStop) {
-    console.log('[hub] HUB_CLEAN_ON_STOP=0: keeping cache');
-    return;
-  }
-  try {
-    fs.rmSync(CACHE_DIR, { recursive: true, force: true });
-    console.log(`[hub] removed cache ${CACHE_DIR}`);
-  } catch (err) {
-    console.error('[hub] cache cleanup failed:', err.message);
   }
 }
 
@@ -42,7 +25,6 @@ export function createShutdown(server) {
     if (shuttingDown) {
       console.warn(`[hub] ${reason} again during shutdown — forcing exit`);
       forceKillBackends();
-      removeRuntimeState();
       process.exit(0);
     }
     shuttingDown = true;
@@ -60,7 +42,6 @@ export function createShutdown(server) {
       finished = true;
       clearInterval(timer);
       forceKillBackends(); // the child exit handler normally removed guards; this is the backstop
-      removeRuntimeState();
       console.log('[hub] shutdown complete');
       process.exit(0);
     };

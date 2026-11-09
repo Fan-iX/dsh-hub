@@ -14,9 +14,9 @@ import {
 import { keyFor, lookupUser, verify } from './accounts.mjs';
 import { backends, getOrCreateBackend } from './instances.mjs';
 import {
-  SESSION_LIST_PATH, deferSessionList, forwardSessionList, isCacheableSessionList,
-  requestRpcId, revalidateSessionList, rpcCache, serveCachedSessionList,
-  sessionListCacheKey, storeSessionList,
+  SESSION_LIST_PATH, forwardSessionList, isCacheableSessionList, isStandardSessionList,
+  loadDiskEntry, maybeRevalidateSessionList, memoryLookup, requestRpcId,
+  serveCachedSessionList, storeSessionList,
 } from './session-list-cache.mjs';
 
 const { handleLogin, handleLogout, sessionInfo, sessionUser } = createLogin({
@@ -89,8 +89,8 @@ export async function route(req, res) {
     return;
   }
 
-  // Session-list RPC cache: serve the last known snapshot forever (serve-stale),
-  // refresh it in the background on a throttle (see the cache module).
+  // Session-list RPC cache: hot memory for a live instance, optional per-user
+  // disk for a respawn. Only the standard `session.list({})` shape is cached.
   if (req.method === 'POST' && url.pathname === SESSION_LIST_PATH) {
     let body;
     try {
@@ -99,32 +99,51 @@ export async function route(req, res) {
       sendJson(res, err.message === 'body too large' ? 413 : 408, { error: err.message }, { 'retry-after': '2' });
       return;
     }
-    const key = sessionListCacheKey(user, body);
-    const entry = rpcCache.get(key);
-    const now = Date.now();
-    if (entry) {
-      const be = backends.get(user);
-      if (be) be.touch(); // a cache hit is browser activity too
-      serveCachedSessionList(res, entry, requestRpcId(body));
-      if (now >= entry.nextRevalidateAt && !entry.inflight) {
-        entry.inflight = true;
-        if (be?.port) {
-          revalidateSessionList(user, be, body, key).catch((err) =>
-            console.error(`[hub] session.list revalidate failed for ${user}:`, err.message));
-        } else {
-          deferSessionList(entry);
+    const rpcId = requestRpcId(body);
+    const standard = rpcId !== undefined && isStandardSessionList(body);
+    let be = backends.get(user);
+    const running = be !== undefined && be.child !== null && be.child.exitCode === null && !be.starting;
+
+    if (standard && running) {
+      const entry = memoryLookup(user);
+      if (entry !== null) {
+        be.touch(); // a cache hit is browser activity too
+        if (await serveCachedSessionList(res, entry, rpcId)) {
+          maybeRevalidateSessionList(user, be, body);
+          return;
+        }
+        if (res.destroyed || res.writableEnded) return;
+      }
+      // Memory miss on a live instance: forward for freshness. The disk tier is
+      // for a stopped/respawning instance, not for an alive one.
+    } else if (standard && !running) {
+      let entry = null;
+      try {
+        entry = await loadDiskEntry(user);
+      } catch (err) {
+        console.warn(`[hub] session.list disk cache read failed for ${user}:`, err.message);
+      }
+      if (entry !== null) {
+        try {
+          if (await serveCachedSessionList(res, entry, rpcId)) return;
+          if (res.destroyed || res.writableEnded) return;
+        } catch (err) {
+          console.warn(`[hub] session.list disk cache serve failed for ${user}:`, err.message);
+          if (res.headersSent) { res.destroy(); return; }
+          // The prefix read failed before headers: fall through to a live forward.
         }
       }
-      return;
+      // No usable disk snapshot: spawn/forward.
     }
-    // No snapshot yet: forward (capturing), cache 200s, respond.
-    let be;
-    try {
-      be = await getOrCreateBackend(user);
-    } catch (err) {
-      console.error(`[hub] spawn failed for ${user}:`, err.message);
-      sendHtml(res, 503, `<pre>dsh-hub: fail to launch\n${err.message}</pre>`);
-      return;
+
+    if (!running) {
+      try {
+        be = await getOrCreateBackend(user);
+      } catch (err) {
+        console.error(`[hub] spawn failed for ${user}:`, err.message);
+        sendHtml(res, 503, `<pre>dsh-hub: fail to launch\n${err.message}</pre>`);
+        return;
+      }
     }
     be.touch();
     req.headers.origin = `http://127.0.0.1:${be.port}`;
@@ -152,7 +171,7 @@ export async function route(req, res) {
     } finally {
       res.removeListener('close', onClientClose);
     }
-    if (isCacheableSessionList(captured)) storeSessionList(key, captured);
+    if (standard && isCacheableSessionList(captured)) storeSessionList(user, captured);
     if (res.destroyed || res.writableEnded) return;
     res.writeHead(captured.status, {
       'content-type': captured.headers['content-type'] ?? 'application/json',
