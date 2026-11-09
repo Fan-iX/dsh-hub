@@ -32,7 +32,8 @@ const SESSION_LIST_TIMEOUT_MS = 120_000;  // a cold store can take 40-66s; never
 export const rpcCache = new Map(); // key -> { status, headers, body, nextRevalidateAt, inflight }
 const RPC_CACHE_MAX = 500;
 const prewarmInflight = new Set();
-// Cache survives hub restarts: entries persist under <cwd>/cache/session-list-<hash>.json.
+// Persistence is opt-in: when CACHE_DIRECTORY is set (systemd CacheDirectory)
+// entries are written under it; otherwise the cache stays in memory only.
 const CACHE_PERSIST_GAP_MS = 300_000;     // throttle disk writes per key (16MB base64 files; async, off the hot path)
 const STANDARD_SESSION_LIST_BODY = Buffer.from(JSON.stringify({
   type: 'client-request', rpcId: 'hub-prewarm', method: 'session/list',
@@ -59,6 +60,7 @@ function cacheFilePathFor(key) {
 }
 
 function persistCacheEntry(key, entry) {
+  if (CACHE_DIR === null) return; // memory-only
   const now = Date.now();
   if (entry.lastPersistAt !== undefined && now - entry.lastPersistAt < CACHE_PERSIST_GAP_MS) return;
   // Async write: a 16MB base64 payload must never block the event loop — the
@@ -77,6 +79,7 @@ function persistCacheEntry(key, entry) {
 }
 
 export function loadPersistedCache() {
+  if (CACHE_DIR === null) return; // memory-only
   try {
     const files = fs.readdirSync(CACHE_DIR).filter((f) => f.endsWith('.json'));
     files.sort((a, b) => {

@@ -53,9 +53,11 @@ server.listen(CFG.hubPort, CFG.hubHost, () => {
     + ' per IP'
     + (CFG.trustedProxies.length ? `, trusting X-Forwarded-For from ${CFG.trustedProxies.join(', ')}` : ', using the TCP peer address only'));
   console.log(`[hub] auth audit log: ${AUTH_LOG_FILE}`);
-  console.log(CFG.cleanOnStop
-    ? `[hub] on SIGTERM/SIGINT/SIGHUP: stop instances and remove ${CACHE_DIR}`
-    : '[hub] on stop: instances stopped, cache kept (HUB_CLEAN_ON_STOP=0)');
+  console.log(CACHE_DIR === null
+    ? '[hub] session-list cache: memory-only (set CACHE_DIRECTORY, or systemd CacheDirectory=dsh-hub, to persist)'
+    : CFG.cleanOnStop
+      ? `[hub] on SIGTERM/SIGINT/SIGHUP: stop instances and remove ${CACHE_DIR}`
+      : '[hub] on stop: instances stopped, cache kept (HUB_CLEAN_ON_STOP=0)');
   console.log(CFG.idleCullMs === 0
     ? '[hub] idle culling DISABLED — backends run until stopped'
     : `[hub] idle cull after ${Math.round(CFG.idleCullMs / 60000)} min`);

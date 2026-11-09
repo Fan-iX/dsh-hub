@@ -9,6 +9,10 @@ Type=simple
 # Environment=DSH_BIN=/opt/dsh-hub/node_modules/@deepseek-ai/dsh/lib/bin.js
 Environment=HUB_PORT=3080
 Environment=HUB_LOG_DIR=/var/log/dsh-hub
+# The session-list cache is memory-only by default. Uncomment both lines to
+# persist it; systemd then creates /var/cache/dsh-hub and sets CACHE_DIRECTORY.
+# CacheDirectory=dsh-hub
+# CacheDirectoryMode=0700
 # Environment=IDLE_CULL_MS=0
 # Environment=ALLOW_USERS=alice,bob
 ExecStart=/usr/bin/env node /opt/dsh-hub/src/index.mjs
@@ -17,7 +21,10 @@ RestartSec=3
 
 # Root needed for: setuid spawn, iptables loopback guards, reading user homes.
 User=root
-WorkingDirectory=/var/lib/dsh-hub
+# The hub keeps no writable state in its working directory; the cache is
+# memory-only unless CacheDirectory is enabled above. It creates HUB_LOG_DIR on
+# startup. A clone/checkout at /opt/dsh-hub is read-only.
+WorkingDirectory=/
 
 [Install]
 WantedBy=multi-user.target

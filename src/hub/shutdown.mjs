@@ -1,7 +1,7 @@
 // Graceful stop for the multi-user hub: kill every spawned instance's process
-// group, release its loopback guard, delete the persisted cache, and exit.
-// Cleanup is best-effort and bounded so a wedged backend can never keep the
-// process alive.
+// group, release its loopback guard, delete the persisted cache when enabled,
+// and exit. Cleanup is best-effort and bounded so a wedged backend can never
+// keep the process alive.
 import fs from 'node:fs';
 
 import { CACHE_DIR, CFG } from './config.mjs';
@@ -17,8 +17,9 @@ function forceKillBackends() {
   }
 }
 
-/** Delete the persisted cache unless cleanup is disabled. */
+/** Delete the persisted cache unless persistence is disabled or cleanup is off. */
 function removeRuntimeState() {
+  if (CACHE_DIR === null) return; // memory-only: nothing on disk
   if (!CFG.cleanOnStop) {
     console.log('[hub] HUB_CLEAN_ON_STOP=0: keeping cache');
     return;

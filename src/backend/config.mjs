@@ -97,9 +97,14 @@ export const BASE = {
 
 export const IS_ROOT = process.getuid?.() === 0;
 
-// Runtime state (the session-list cache) lives in the launch directory — the
-// service's WorkingDirectory — not in the checkout, which may be read-only or
-// shared after deployment. The path is therefore resolved from the process
-// working directory, not relative to this module.
-export const RUNTIME_DIR = process.cwd();
-export const CACHE_DIR = path.join(RUNTIME_DIR, 'cache');
+// The persistent session-list cache is optional. `CACHE_DIRECTORY` is set by
+// systemd's `CacheDirectory=dsh-hub` (or explicitly by an operator); when it is
+// unset the cache is memory-only. The hub keeps no writable state in its
+// working directory, so `WorkingDirectory=/` is sufficient.
+const cacheDirectory = process.env.CACHE_DIRECTORY;
+export const CACHE_DIR = cacheDirectory && path.isAbsolute(cacheDirectory)
+  ? cacheDirectory
+  : null;
+if (cacheDirectory && CACHE_DIR === null) {
+  console.warn(`[hub] ignoring CACHE_DIRECTORY=${JSON.stringify(cacheDirectory)}: must be an absolute path`);
+}
