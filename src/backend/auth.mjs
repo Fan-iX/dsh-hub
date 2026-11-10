@@ -466,13 +466,52 @@ export function createLogin({ verify, keyFor, auditPath, cfg }) {
     }
   }, 60_000).unref();
 
-  function sign(user, exp, key) {
-    return crypto.createHmac('sha256', key).update(`${user}.${exp}`).digest('base64url');
+  function sign(user, exp, iat, key) {
+    return crypto.createHmac('sha256', key).update(`${user}.${exp}.${iat}`).digest('base64url');
   }
 
-  function makeCookie(user, key) {
-    const exp = Date.now() + cfg.sessionTtlMs;
-    return `${user}.${exp}.${sign(user, exp, key)}`;
+  function makeCookie(user, key, iat = Date.now()) {
+    const exp = Math.min(iat + cfg.sessionTtlMs, iat + cfg.sessionMaxTtlMs);
+    return { token: `${user}.${exp}.${iat}.${sign(user, exp, iat, key)}`, exp, iat };
+  }
+
+  /**
+   * Extend a live session when it is near expiry. The effective threshold is
+   * min(SESSION_REFRESH_THRESHOLD_MS, SESSION_TTL_MS / 2), so a refreshed cookie
+   * is always far enough from expiry to avoid immediate re-triggering. Returns
+   * null when no refresh is due or the absolute SESSION_MAX_TTL_MS cap is hit.
+   */
+  function refreshCookie(user, exp, iat, key) {
+    const now = Date.now();
+    const threshold = Math.min(cfg.sessionRefreshThresholdMs, Math.max(0, cfg.sessionTtlMs / 2));
+    if (exp - now > threshold) return null;
+    const maxExp = iat + cfg.sessionMaxTtlMs;
+    const newExp = Math.min(now + cfg.sessionTtlMs, maxExp);
+    if (newExp <= exp) return null; // no extension possible at the 7-day cap
+    return { token: `${user}.${newExp}.${iat}.${sign(user, newExp, iat, key)}`, exp: newExp, iat };
+  }
+
+  function appendSetCookie(res, value) {
+    const prev = res.getHeader('set-cookie');
+    const list = prev === undefined ? [] : (Array.isArray(prev) ? prev : [prev]);
+    res.setHeader('set-cookie', [...list, value]);
+  }
+
+  /**
+   * Add a refreshed session cookie to `res` when due. The caller supplies the
+   * sessionInfo result and gets the effective exp back (the old one when no
+   * refresh happened), so /hub/api/session reports the post-refresh TTL.
+   */
+  function maybeRefreshSession(res, session) {
+    if (session === null) return null;
+    const key = keyFor(session.user, false);
+    if (key === null) return null;
+    const fresh = refreshCookie(session.user, session.exp, session.iat, key);
+    if (fresh === null) return session.exp;
+    const maxAge = Math.max(0, Math.floor((fresh.exp - Date.now()) / 1000));
+    appendSetCookie(res,
+      `${cfg.cookieName}=${fresh.token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}`);
+    return fresh.exp;
   }
 
   function parseCookie(req) {
@@ -484,21 +523,22 @@ export function createLogin({ verify, keyFor, auditPath, cfg }) {
     return null;
   }
 
-  /** The authenticated session (user and signed expiry), or null. */
+  /** The authenticated session (user, signed expiry, issued-at), or null. */
   function sessionInfo(req) {
     const val = parseCookie(req);
     if (!val) return null;
-    const m = /^(.+)\.(\d+)\.(.+)$/.exec(val);
+    const m = /^(.+)\.(\d+)\.(\d+)\.(.+)$/.exec(val);
     if (!m) return null;
-    const [, user, expStr, sig] = m;
+    const [, user, expStr, iatStr, sig] = m;
     const exp = Number(expStr);
-    if (!Number.isFinite(exp) || exp < Date.now()) return null;
+    const iat = Number(iatStr);
+    if (!Number.isFinite(exp) || !Number.isFinite(iat) || exp < Date.now()) return null;
     const key = keyFor(user, false);
     if (key === null) return null;
-    const expect = sign(user, exp, key);
+    const expect = sign(user, exp, iat, key);
     const a = Buffer.from(sig), b = Buffer.from(expect);
     if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
-    return { user, exp };
+    return { user, exp, iat };
   }
 
   /** The authenticated username from the session cookie, or null. */
@@ -564,9 +604,9 @@ export function createLogin({ verify, keyFor, auditPath, cfg }) {
       return;
     }
     audit(`login ok user=${logToken(username)} ip=${logToken(ip)}${via}`);
-    const token = makeCookie(username, key);
+    const { token, exp } = makeCookie(username, key);
     res.writeHead(303, {
-      'set-cookie': `${cfg.cookieName}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(cfg.sessionTtlMs / 1000)}`,
+      'set-cookie': `${cfg.cookieName}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.max(0, Math.floor((exp - Date.now()) / 1000))}`,
       location: '/',
     });
     res.end();
@@ -580,5 +620,5 @@ export function createLogin({ verify, keyFor, auditPath, cfg }) {
     res.end();
   }
 
-  return { handleLogin, handleLogout, sessionInfo, sessionUser };
+  return { handleLogin, handleLogout, sessionInfo, sessionUser, maybeRefreshSession };
 }

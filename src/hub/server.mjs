@@ -19,7 +19,7 @@ import {
   serveCachedSessionList, storeSessionList,
 } from './session-list-cache.mjs';
 
-const { handleLogin, handleLogout, sessionInfo, sessionUser } = createLogin({
+const { handleLogin, handleLogout, sessionInfo, sessionUser, maybeRefreshSession } = createLogin({
   verify, keyFor, auditPath: AUTH_LOG_FILE, cfg: CFG,
 });
 
@@ -77,10 +77,13 @@ export async function route(req, res) {
     return;
   }
   if (url.pathname === '/hub/api/session') {
+    // A near-expiry session is extended here; the probe response reports the
+    // post-refresh TTL so dsh-hub-utils can re-arm its expiry timer.
+    const effectiveExp = maybeRefreshSession(res, session) ?? session.exp;
     sendJson(res, 200, {
       authenticated: true,
       user,
-      expiresInSec: Math.max(0, Math.floor((session.exp - Date.now()) / 1000)),
+      expiresInSec: Math.max(0, Math.floor((effectiveExp - Date.now()) / 1000)),
     });
     return;
   }
@@ -227,6 +230,13 @@ export async function route(req, res) {
   }
   // Force identity encoding so the HTML rewrite sees plain text.
   req.headers['accept-encoding'] = 'identity';
+  // Sending a message is a strong activity signal; refresh the session cookie
+  // on the prompt response (dsh-proxy merges it with dsh's own Set-Cookie). The
+  // session-list RPC is deliberately not a refresh source: it can be driven by
+  // background WebSocket events.
+  if (url.pathname === '/api/session/prompt') {
+    maybeRefreshSession(res, session);
+  }
   proxy.web(req, res, { target: `http://127.0.0.1:${be.port}` });
 }
 

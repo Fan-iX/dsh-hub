@@ -13,7 +13,7 @@ import {
   startingPage, t, wantsDocument,
 } from '../backend/web.mjs';
 
-const { handleLogin, handleLogout, sessionInfo, sessionUser } = createLogin({
+const { handleLogin, handleLogout, sessionInfo, sessionUser, maybeRefreshSession } = createLogin({
   verify, keyFor, auditPath: CFG.authLogPath, cfg: CFG,
 });
 
@@ -101,10 +101,11 @@ export async function route(req, res) {
     return;
   }
   if (url.pathname === '/hub/api/session') {
+    const effectiveExp = maybeRefreshSession(res, session) ?? session.exp;
     sendJson(res, 200, {
       authenticated: true,
       user,
-      expiresInSec: Math.max(0, Math.floor((session.exp - Date.now()) / 1000)),
+      expiresInSec: Math.max(0, Math.floor((effectiveExp - Date.now()) / 1000)),
     });
     return;
   }
@@ -151,6 +152,10 @@ export async function route(req, res) {
   }
   // Force identity encoding so the HTML rewrite sees plain text.
   req.headers['accept-encoding'] = 'identity';
+  // Sending a message refreshes the sliding session cookie; see the hub route.
+  if (url.pathname === '/api/session/prompt') {
+    maybeRefreshSession(res, session);
+  }
   proxy.web(req, res, { target: `http://127.0.0.1:${be.port}` });
 }
 

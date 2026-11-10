@@ -68,8 +68,24 @@ export const proxy = httpProxy.createProxyServer({
   selfHandleResponse: true, // we own the response so we can rewrite HTML
 });
 
-proxy.on('proxyRes', (proxyRes, req, res) => {
-  const ct = String(proxyRes.headers['content-type'] ?? '');
+/**
+ * Append a hub session-refresh Set-Cookie (already set on `res` by the caller)
+ * to a proxied response. dsh sets its own cookies on some routes, so both must
+ * survive; the hub's cookie is the distinct `dshhub_session` name.
+ */
+function mergeSetCookie(headers, res) {
+  const ours = res.getHeader('set-cookie');
+  if (ours === undefined) return headers;
+  const list = Array.isArray(ours) ? [...ours] : [ours];
+  const theirs = headers['set-cookie'];
+  if (theirs !== undefined) {
+    if (Array.isArray(theirs)) list.push(...theirs);
+    else list.push(theirs);
+  }
+  return { ...headers, 'set-cookie': list };
+}
+
+proxy.on('proxyRes', (proxyRes, req, res) => {  const ct = String(proxyRes.headers['content-type'] ?? '');
   const url = String(req.url ?? '');
   const reqPath = new URL(url, 'http://x').pathname;
   const be = req.hubBackend;
@@ -104,7 +120,7 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
   }
   if (!/text\/html/i.test(ct)) {
     if (res.destroyed || res.writableEnded) { proxyRes.resume(); return; }
-    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+    res.writeHead(proxyRes.statusCode, mergeSetCookie(proxyRes.headers, res));
     proxyRes.pipe(res);
     return;
   }
@@ -113,7 +129,7 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
   proxyRes.on('error', () => res.destroy());
   proxyRes.on('end', () => {
     if (res.destroyed || res.writableEnded) return;
-    const headers = { ...proxyRes.headers };
+    const headers = mergeSetCookie(proxyRes.headers, res);
     delete headers['content-length'];
     delete headers['content-encoding'];
     res.writeHead(proxyRes.statusCode, headers);
@@ -243,11 +259,12 @@ export async function bridgeDshBrowserSession(req, res, be, { force = false } = 
   const setCookie = await mintDshSessionCookie(be, authority);
   if (!setCookie) return false;
   if (res.destroyed || res.writableEnded) return false;
+  const merged = mergeSetCookie({ 'set-cookie': setCookie }, res);
   res.writeHead(303, {
     'cache-control': 'no-store',
     'referrer-policy': 'no-referrer',
     location: '/',
-    'set-cookie': setCookie,
+    'set-cookie': merged['set-cookie'],
   });
   res.end();
   return true;

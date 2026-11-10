@@ -74,6 +74,10 @@ export const BASE = {
   hubPort: int(process.env.HUB_PORT, 3080),
   dshBin: detectDshBin(),
   sessionTtlMs: int(process.env.SESSION_TTL_MS, 24 * 3600 * 1000),
+  // Sliding refresh: a session may be extended up to this absolute age. The
+  // effective refresh threshold is min(SESSION_REFRESH_THRESHOLD_MS, TTL / 2).
+  sessionMaxTtlMs: int(process.env.SESSION_MAX_TTL_MS, 7 * 24 * 3600 * 1000),
+  sessionRefreshThresholdMs: int(process.env.SESSION_REFRESH_THRESHOLD_MS, 6 * 3600 * 1000),
   // 0 disables culling entirely. A positive value reaps instances that have no
   // browser activity, no attached event stream, and no keep-alive pin.
   idleCullMs: intOrZero(process.env.IDLE_CULL_MS, 4 * 3600 * 1000),
