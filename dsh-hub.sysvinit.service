@@ -20,6 +20,7 @@ ENTRYPOINT="src/index.mjs"
 : "${DSH_HUB_DIR:=/opt/dsh-hub}"
 : "${DSH_HUB_PIDFILE:=/run/${NAME}.pid}"
 : "${NODE_BINARY:=$(command -v node || echo /usr/bin/node)}"
+export CACHE_DIRECTORY="${CACHE_DIRECTORY-/var/cache/dsh-hub}"
 
 log()
 {
@@ -61,8 +62,6 @@ start()
 		return 1
 	}
 
-	# No writable state directory: the session-list cache is memory-only unless
-	# CACHE_DIRECTORY is set, and the hub creates HUB_LOG_DIR on startup.
 	cd / || return 1
 	"${NODE_BINARY}" "${DSH_HUB_DIR}/${ENTRYPOINT}" &
 	pid=$!

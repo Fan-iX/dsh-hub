@@ -9,10 +9,8 @@ Type=simple
 # Environment=DSH_BIN=/opt/dsh-hub/node_modules/@deepseek-ai/dsh/lib/bin.js
 Environment=HUB_PORT=3080
 Environment=HUB_LOG_DIR=/var/log/dsh-hub
-# The session-list cache is memory-only by default. Uncomment both lines to
-# persist it; systemd then creates /var/cache/dsh-hub and sets CACHE_DIRECTORY.
-# CacheDirectory=dsh-hub
-# CacheDirectoryMode=0700
+CacheDirectory=dsh-hub
+CacheDirectoryMode=0700
 # Environment=IDLE_CULL_MS=0
 # Environment=ALLOW_USERS=alice,bob
 ExecStart=/usr/bin/env node /opt/dsh-hub/src/index.mjs

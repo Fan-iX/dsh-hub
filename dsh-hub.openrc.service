@@ -6,13 +6,12 @@ description="multi-user front for DeepSeek Harness"
 : ${DSH_HUB_PIDFILE:=${RC_PREFIX%/}/run/${SVCNAME}.pid}
 : ${DSH_HUB_DIR:=${RC_PREFIX%/}/opt/dsh-hub}
 : ${NODE_BINARY:=$(command -v node || echo /usr/bin/node)}
+export CACHE_DIRECTORY="${CACHE_DIRECTORY-${RC_PREFIX%/}/var/cache/dsh-hub}"
 
 command="${NODE_BINARY}"
 command_args="${DSH_HUB_DIR}/src/index.mjs"
 command_background="yes"
 pidfile="${DSH_HUB_PIDFILE}"
-# No writable state directory: the session-list cache is memory-only unless
-# CACHE_DIRECTORY is set, and the hub creates HUB_LOG_DIR on startup.
 directory="/"
 
 depend()
