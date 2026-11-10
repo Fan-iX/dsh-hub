@@ -137,6 +137,8 @@ with it.
 | `TRUST_MODE` | `origin-rewrite` | `trusted-host` forwards Host/Origin untouched (see [Trust model](#trust-model)) |
 | `TRUSTED_HOSTS` | auto (LAN IPv4s) | extra authorities for `--trusted-host` |
 | `SESSION_TTL_MS` | `86400000` (1 day) | session cookie lifetime |
+| `SESSION_MAX_TTL_MS` | `604800000` (7 days) | absolute cap for sliding session renewal |
+| `SESSION_REFRESH_THRESHOLD_MS` | `21600000` (6 h) | refresh when the remaining lifetime is below `min(this, SESSION_TTL_MS / 2)` |
 | `IDLE_CULL_MS` | `14400000` (4 h) | `0` disables idle culling |
 | `CULL_INTERVAL_MS` | `60000` (1 min) | how often the culler checks |
 | `SPAWN_TIMEOUT_MS` | `60000` | how long to wait for a spawned dsh to accept TCP |
@@ -249,7 +251,21 @@ native PAM path is available; without them the verifier uses the `su` fallback,
 and logs a warning when neither is usable.
 
 Sessions are `HttpOnly; SameSite=Lax` cookies with `SESSION_TTL_MS` (default one
-day). Logout clears the browser cookie; there is no server-side session list or
+day). A live session slides: when the remaining lifetime is below
+`min(SESSION_REFRESH_THRESHOLD_MS, SESSION_TTL_MS / 2)`, the hub extends it on
+`GET /hub/api/session` (the `dsh-hub-utils` session watcher probes this on page
+load and tab activation) and on `POST /api/session/prompt` (sending a message).
+The cookie keeps its original `iat`; renewal stops at `SESSION_MAX_TTL_MS`
+(default 7 days), after which the session expires and the user logs in again.
+
+There is no periodic refresh and no hub-side throttle: the refreshed `exp` is
+the rate limit, and a few concurrent/tab `Set-Cookie` responses are valid (the
+browser keeps the last). The `/api/session/list` RPC is deliberately **not** a
+refresh source because it can be driven by background WebSocket events; the
+`dsh-hub-utils` watcher also probes only while the tab is visible. A hidden tab
+and a foreground tab with no user action therefore do not extend the session.
+
+Logout clears the browser cookie; there is no server-side session list or
 per-session revocation. Account deletion is picked up within the passwd-cache TTL
 (60 s); login and instance spawn force a fresh NSS read.
 
