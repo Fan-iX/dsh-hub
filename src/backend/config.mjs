@@ -86,10 +86,12 @@ export const BASE = {
   shutdownGraceMs: int(process.env.SHUTDOWN_GRACE_MS, 5000),
   cookieName: 'dshhub_session',
   // Login guard: failures are counted per client IP inside a sliding window.
-  // Reaching AUTH_MAX_FAILURES within AUTH_WINDOW_MS answers 429 until the
-  // oldest counted failure ages out of the window.
+  // Reaching AUTH_MAX_FAILURES redirects the POST to the lockout page (PRG)
+  // until the oldest counted failure ages out of the window. Keeping this at or
+  // below the PAM faillock deny threshold surfaces the same message when PAM
+  // locks the account first.
   authWindowMs: int(process.env.AUTH_WINDOW_MS, 10 * 60 * 1000),
-  authMaxFailures: int(process.env.AUTH_MAX_FAILURES, 5),
+  authMaxFailures: int(process.env.AUTH_MAX_FAILURES, 3),
   // Existing account whose password check runs for unknown usernames, so the
   // response time does not reveal whether an account exists. Empty disables it.
   authDecoyUser: process.env.AUTH_DECOY_USER ?? 'nobody',

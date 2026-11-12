@@ -149,7 +149,11 @@ export async function verify(username, password) {
     }
     return { ok: false, reason: 'unknown-user' };
   }
-  if (!await pamAuthenticate(username, password)) return { ok: false, reason: 'auth-failed' };
+  const auth = await pamAuthenticate(username, password);
+  if (!auth.ok) {
+    // PAM_MAXTRIES (11) is a PAM-side lockout; surface it like our own guard.
+    return { ok: false, reason: auth.code === 11 ? 'too-many' : 'auth-failed' };
+  }
   const credential = await refreshCredential(username, false);
   if (credential === null) return { ok: false, reason: 'shadow-unavailable' };
   if (!credential.hasPassword && !CFG.allowNoPassword) return { ok: false, reason: 'no-password' };

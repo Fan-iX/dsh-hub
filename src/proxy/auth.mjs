@@ -27,8 +27,10 @@ export async function verify(username, password) {
     }
     return { ok: false, reason: 'unknown-user' };
   }
-  const ok = await pamAuthenticate(username, password);
-  return ok ? { ok: true } : { ok: false, reason: 'auth-failed' };
+  const auth = await pamAuthenticate(username, password);
+  return auth.ok
+    ? { ok: true }
+    : { ok: false, reason: auth.code === 11 ? 'too-many' : 'auth-failed' };
 }
 
 /**

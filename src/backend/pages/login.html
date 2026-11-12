@@ -19,7 +19,7 @@
         <p class="sub">{{subtitle}}</p>
       </div>
     </header>
-    <form method="post" action="/hub/login">
+    <form id="login" method="post" action="/hub/login" data-retry="{{retry}}">
       <label for="u">{{username}}</label>
       <input id="u" name="username" autocomplete="username" autofocus required>
       <label for="p">{{password}}</label>
@@ -27,6 +27,31 @@
       <div class="err" role="alert">{{message}}</div>
       <button type="submit">{{submit}}</button>
     </form>
+    <script>
+      (() => {
+        const form = document.getElementById('login');
+        if (!form) return;
+        const inputs = Array.from(form.querySelectorAll('input[name]'));
+        const button = form.querySelector('button[type="submit"]');
+        // After a failed attempt, require one input action before resubmitting.
+        // Retyping the same credentials is fine; only the input event matters.
+        const retry = form.getAttribute('data-retry') === '1';
+        let armed = !retry;
+        if (retry && button) button.disabled = true;
+        for (const input of inputs) {
+          input.addEventListener('input', () => {
+            armed = true;
+            if (button) button.disabled = false;
+          });
+        }
+        form.addEventListener('submit', (event) => {
+          if (!armed) { event.preventDefault(); return; }
+          // readonly (not disabled) keeps the values in the form submission.
+          for (const input of inputs) input.readOnly = true;
+          if (button) button.disabled = true;
+        });
+      })();
+    </script>
     <nav class="lang" aria-label="{{langLabel}}">{{langSwitch}}</nav>
   </main>
 </body>

@@ -11,7 +11,7 @@ import { promisify } from 'node:util';
 
 import { IS_ROOT } from './config.mjs';
 import {
-  localeFromRequest, loginPage, pageHeaders, readBody, sendHtml, t, urlencoded,
+  localeFromRequest, pageHeaders, readBody, urlencoded,
 } from './web.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -150,14 +150,14 @@ function nativePam(username, password) {
   });
 }
 
-/** Verify `username`'s password. The caller maps false to a generic failure. */
+/** Verify `username`'s password. The caller maps !ok to a generic failure. */
 export async function pamAuthenticate(username, password) {
   // Prefer native PAM in both modes: the root hub can verify any account, and
   // the non-root proxy verifies its own service account in-process.
   if (pamNative !== null) {
     const verdict = await nativePam(username, password);
-    if (verdict.ok) return true;
-    if (!PAM_UNVERIFIABLE.has(verdict.code)) return false;
+    if (verdict.ok) return { ok: true, code: 0 };
+    if (!PAM_UNVERIFIABLE.has(verdict.code)) return { ok: false, code: verdict.code };
     // The PAM stack could not check here (e.g. unix_chkpwd restrictions for a
     // non-root caller); fall back to su.
     if (ptySpawn === null && !warnedSuFallback) {
@@ -165,8 +165,10 @@ export async function pamAuthenticate(username, password) {
       console.warn('[hub] auth: native PAM could not verify; using the su stdin fallback');
     }
   }
-  if (ptySpawn !== null) return suViaPty(username, password);
-  return suViaStdin(username, password);
+  const ok = ptySpawn !== null
+    ? await suViaPty(username, password)
+    : await suViaStdin(username, password);
+  return { ok, code: ok ? 0 : -1 };
 }
 
 /**
@@ -547,12 +549,14 @@ export function createLogin({ verify, keyFor, auditPath, cfg }) {
     return info === null ? null : info.user;
   }
 
-  function sendBlocked(res, locale, headers, ip, wait) {
+  function sendBlocked(req, res, headers, ip, wait) {
     audit(`login blocked ip=${logToken(ip)} retry_after=${wait}s`);
-    const amount = t(locale, wait < 60 ? 'wait.seconds' : 'wait.minutes',
-      { n: wait < 60 ? wait : Math.ceil(wait / 60) });
-    sendHtml(res, 429, loginPage(locale, t(locale, 'error.tooManyAttempts', { wait: amount })),
-      { ...headers, 'retry-after': String(wait) });
+    // PRG: the browser follows with a GET, so a refresh cannot re-POST the
+    // password or add another PAM failure. The GET renders the same message
+    // used for the AUTH_MAX_FAILURES lockout.
+    req.resume();
+    res.writeHead(303, { ...headers, location: `/hub/login?error=blocked&wait=${wait}` });
+    res.end();
   }
 
   async function handleLogin(req, res) {
@@ -563,19 +567,20 @@ export function createLogin({ verify, keyFor, auditPath, cfg }) {
     const via = ip === peer ? '' : ` proxy=${logToken(peer)}`;
     const wait = loginBlockSeconds(ip);
     if (wait > 0) {
-      sendBlocked(res, locale, headers, ip, wait);
+      sendBlocked(req, res, headers, ip, wait);
       return;
     }
     const { username, password } = urlencoded(await readBody(req));
     if (!username || !password) {
       audit(`login rejected reason=missing-credentials ip=${logToken(ip)}${via}`);
-      sendHtml(res, 401, loginPage(locale, t(locale, 'error.missingCredentials')), headers);
+      res.writeHead(303, { ...headers, location: '/hub/login?error=missing' });
+      res.end();
       return;
     }
     // Reserve before awaiting verification so a concurrent burst cannot exceed
     // the window.
     if (!reserveAttempt(ip)) {
-      sendBlocked(res, locale, headers, ip, loginBlockSeconds(ip) || 1);
+      sendBlocked(req, res, headers, ip, loginBlockSeconds(ip) || 1);
       return;
     }
     let result;
@@ -591,7 +596,18 @@ export function createLogin({ verify, keyFor, auditPath, cfg }) {
       const blocked = loginBlockSeconds(ip);
       audit(`login failed user=${logToken(username)} reason=${result?.reason ?? 'auth-error'} ip=${logToken(ip)}${via}`
         + (blocked > 0 ? ` blocked_for=${blocked}s` : ''));
-      sendHtml(res, 401, loginPage(locale, t(locale, 'error.badCredentials')), headers);
+      if (result?.reason === 'too-many') {
+        // PAM_MAXTRIES: PAM itself has locked the account. Show the same
+        // message as our own guard; use its window when our counter is empty.
+        sendBlocked(req, res, headers, ip, blocked || Math.ceil(cfg.authWindowMs / 1000));
+        return;
+      }
+      if (blocked > 0) {
+        sendBlocked(req, res, headers, ip, blocked);
+        return;
+      }
+      res.writeHead(303, { ...headers, location: '/hub/login?error=bad' });
+      res.end();
       return;
     }
     const key = keyFor(username, true);
@@ -600,7 +616,12 @@ export function createLogin({ verify, keyFor, auditPath, cfg }) {
       const blocked = loginBlockSeconds(ip);
       audit(`login failed user=${logToken(username)} reason=key-unavailable ip=${logToken(ip)}${via}`
         + (blocked > 0 ? ` blocked_for=${blocked}s` : ''));
-      sendHtml(res, 401, loginPage(locale, t(locale, 'error.badCredentials')), headers);
+      if (blocked > 0) {
+        sendBlocked(req, res, headers, ip, blocked);
+      } else {
+        res.writeHead(303, { ...headers, location: '/hub/login?error=bad' });
+        res.end();
+      }
       return;
     }
     audit(`login ok user=${logToken(username)} ip=${logToken(ip)}${via}`);

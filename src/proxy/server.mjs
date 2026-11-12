@@ -9,7 +9,7 @@ import { createLogin } from '../backend/auth.mjs';
 import { DshInstance } from '../backend/instance.mjs';
 import { bridgeDshBrowserSession, isIndexPath, proxy } from '../backend/dsh-proxy.mjs';
 import {
-  handleKeepAlive, localeFromRequest, loginPage, pageHeaders, sendHtml, sendJson,
+  handleKeepAlive, localeFromRequest, loginErrorMessage, loginPage, pageHeaders, sendHtml, sendJson,
   startingPage, t, wantsDocument,
 } from '../backend/web.mjs';
 
@@ -71,7 +71,10 @@ export async function route(req, res) {
 
   if (url.pathname === '/hub/login' && req.method === 'GET') {
     const locale = localeFromRequest(req);
-    sendHtml(res, 200, loginPage(locale, ''), pageHeaders(req, locale));
+    const error = url.searchParams.get('error');
+    sendHtml(res, 200,
+      loginPage(locale, loginErrorMessage(locale, error, url.searchParams.get('wait')), error !== null),
+      pageHeaders(req, locale));
     return;
   }
   if (url.pathname === '/hub/login' && req.method === 'POST') {

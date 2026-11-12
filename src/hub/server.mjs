@@ -8,7 +8,7 @@ import {
   bridgeDshBrowserSession, hubDshCookieHeader, isIndexPath, proxy,
 } from '../backend/dsh-proxy.mjs';
 import {
-  handleKeepAlive, localeFromRequest, loginPage, pageHeaders, readRequestBody, sendHtml,
+  handleKeepAlive, localeFromRequest, loginErrorMessage, loginPage, pageHeaders, readRequestBody, sendHtml,
   sendJson, startingPage, t, wantsDocument,
 } from '../backend/web.mjs';
 import { keyFor, lookupUser, verify } from './accounts.mjs';
@@ -47,7 +47,10 @@ export async function route(req, res) {
 
   if (url.pathname === '/hub/login' && req.method === 'GET') {
     const locale = localeFromRequest(req);
-    sendHtml(res, 200, loginPage(locale, ''), pageHeaders(req, locale));
+    const error = url.searchParams.get('error');
+    sendHtml(res, 200,
+      loginPage(locale, loginErrorMessage(locale, error, url.searchParams.get('wait')), error !== null),
+      pageHeaders(req, locale));
     return;
   }
   if (url.pathname === '/hub/login' && req.method === 'POST') {

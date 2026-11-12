@@ -296,7 +296,7 @@ function languageSwitch(locale) {
  * @param message - already-localized error or notice for the message slot.
  * @returns the login page HTML.
  */
-export function loginPage(locale, message = '') {
+export function loginPage(locale, message = '', retry = false) {
   return render(LOGIN_TEMPLATE, {
     lang: locale,
     style: THEME,
@@ -307,9 +307,27 @@ export function loginPage(locale, message = '') {
     password: t(locale, 'login.password'),
     submit: t(locale, 'login.submit'),
     message: escapeHtml(message),
+    retry: retry ? '1' : '',
     langLabel: t(locale, 'login.langLabel'),
     langSwitch: languageSwitch(locale),
   });
+}
+
+/**
+ * Localized message for the PRG target `/hub/login?error=...`. Kept here so
+ * both entry points (hub and proxy) render the same text, including the
+ * AUTH_MAX_FAILURES / PAM lockout message.
+ */
+export function loginErrorMessage(locale, error, wait = 0) {
+  if (error === 'bad') return t(locale, 'error.badCredentials');
+  if (error === 'missing') return t(locale, 'error.missingCredentials');
+  if (error === 'blocked') {
+    const seconds = Math.max(1, Number(wait) || 0);
+    const amount = t(locale, seconds < 60 ? 'wait.seconds' : 'wait.minutes',
+      { n: seconds < 60 ? seconds : Math.ceil(seconds / 60) });
+    return t(locale, 'error.tooManyAttempts', { wait: amount });
+  }
+  return '';
 }
 
 /**
