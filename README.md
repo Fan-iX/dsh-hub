@@ -144,7 +144,7 @@ with it.
 | `SPAWN_TIMEOUT_MS` | `60000` | how long to wait for a spawned dsh to accept TCP |
 | `SHUTDOWN_GRACE_MS` | `5000` | grace before a stopping dsh is `SIGKILL`ed |
 | `AUTH_WINDOW_MS` | `600000` (10 min) | sliding window for failed logins per client IP |
-| `AUTH_MAX_FAILURES` | `5` | failures within the window before `/hub/login` answers `429` |
+| `AUTH_MAX_FAILURES` | `3` | failures within the window before `/hub/login` shows the lockout page |
 | `AUTH_DECOY_USER` | `nobody` | existing account whose PAM check equalizes unknown-username timing |
 | `TRUSTED_PROXIES` | *(none)* | comma-separated IPs/CIDRs whose `X-Forwarded-For` / `X-Real-IP` is trusted |
 
@@ -269,6 +269,33 @@ Logout clears the browser cookie; there is no server-side session list or
 per-session revocation. Account deletion is picked up within the passwd-cache TTL
 (60 s); login and instance spawn force a fresh NSS read.
 
+Login is stateless on the server beyond the existing per-IP failure window. A
+failed POST answers a 303 to `/hub/login?error=...`, so refreshing the page
+cannot replay it. The form locks its fields (`readonly`) and submit button while
+the request is in flight, and after a credential error it requires one input
+action before the next submit; retyping the same credentials is allowed. The
+`AUTH_MAX_FAILURES` lockout and a `PAM_MAXTRIES` result use the same "too many
+attempts" message.
+
+PAM control flow uses the value returned by libpam. Which code a login gets is
+chosen by the PAM stack and its modules (`pam_unix`, `pam_faillock`, `pam_sss`,
+...): the same wrong password can be `PAM_AUTH_ERR` (7),
+`PAM_AUTHINFO_UNAVAIL` (9), etc. `PAM_MAXTRIES` (11) maps to the lockout page;
+`PAM_CRED_INSUFFICIENT` (8) and `PAM_AUTHINFO_UNAVAIL` (9) are the codes that can
+trigger the `su` fallback when the native stack cannot check. The `su` fallback
+is a second PAM check; on distros whose `su` stack also has `pam_faillock`, a
+wrong password that the native stack reports as unverifiable can record a second
+failure. Prefer a native PAM service that can read the shadow (so the fallback
+is not needed) or keep the `su` stack free of `pam_faillock` for the hub account.
+
+A locked account commonly reports 7/9, which is not distinguishable from a
+wrong password by code alone; keep `AUTH_MAX_FAILURES` at or below the PAM
+`deny` threshold so the hub's "too many attempts" message appears at the same
+attempt count. The addon does not expose PAM's `PAM_ERROR_MSG`/`PAM_TEXT_INFO`
+conversation messages, so the hub cannot display `pam_faillock`'s own
+"account locked" text (sshd's conversation does); it relies on
+`AUTH_MAX_FAILURES` and `PAM_MAXTRIES` instead.
+
 ### NSS lookups
 
 Account existence and the shadow fingerprint go through `getent`, which can block
@@ -329,8 +356,9 @@ redirect lives in the browser plugin rather than in the proxy.
 ### Login guard and audit log
 
 `/hub/login` counts failed attempts per client IP in a sliding window
-(`AUTH_MAX_FAILURES` within `AUTH_WINDOW_MS`); reaching it answers `429` with
-`Retry-After` until the oldest failure ages out. Client addresses are
+(`AUTH_MAX_FAILURES` within `AUTH_WINDOW_MS`); reaching it redirects the POST to
+`/hub/login?error=blocked` (PRG) with the lockout message and the remaining wait,
+until the oldest failure ages out. Client addresses are
 canonicalized (zone ids, brackets, ports, IPv4-mapped IPv6, IPv6 spelling), and
 `X-Forwarded-For` / `X-Real-IP` are honored only when the TCP peer is listed in
 `TRUSTED_PROXIES`; otherwise the peer address is authoritative, and the
